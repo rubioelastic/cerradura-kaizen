@@ -44,7 +44,9 @@ typedef enum {
     UI_STATE_ADD_MODE    = 3,  // Modo: añadir matrícula
     UI_STATE_REMOVE_MODE = 4,  // Modo: eliminar matrícula
     UI_STATE_REMOVE_ALL  = 5,  // Modo: eliminar todas las matrículas
-    UI_STATE_ERROR       = 6   // Error de sistema
+    UI_STATE_ERROR       = 6,  // Error de sistema
+    UI_STATE_LIBRE       = 7,  // Espacio LIBRE (Bridge conectado)
+    UI_STATE_OCUPADO     = 8   // Espacio OCUPADO (Bridge conectado)
 } UIState;
 
 // ─────────────────────────────────────────────────────────────
@@ -329,6 +331,135 @@ public:
         _disp.setTextColor(COL_CYAN);
         _disp.setTextDatum(MC_DATUM);
         _disp.drawString(matricula, 120, 185);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Pantalla de CONFIRMACIÓN DE LIBERACIÓN
+    //   Se muestra cuando la misma persona que ocupó presenta
+    //   su tarjeta de nuevo. Pregunta si quiere liberar el espacio
+    //   o simplemente entrar de nuevo.
+    //   countdown: segundos restantes (0–3) para actualizar sin redibujar.
+    // ─────────────────────────────────────────────────────────
+    void drawConfirmRelease(int countdown, bool fullDraw = true) {
+        _currentState = UI_STATE_OCUPADO; // reutiliza el estado
+        if (fullDraw) {
+            _disp.fillScreen(0x2800); // naranja muy oscuro
+            _disp.drawCircle(120, 120, 115, COL_ORANGE);
+            _disp.drawCircle(120, 120, 113, COL_ORANGE);
+
+            // Icono candado entreabierto
+            drawLockIcon(120, 50, COL_ORANGE, false);
+
+            // Pregunta
+            _disp.setTextSize(2);
+            _disp.setTextColor(COL_ORANGE);
+            _disp.setTextDatum(MC_DATUM);
+            _disp.drawString("¿LIBERAR", 120, 108);
+            _disp.drawString("ESPACIO?", 120, 130);
+
+            // Instrucción
+            _disp.setTextSize(1);
+            _disp.setTextColor(COL_WHITE);
+            _disp.drawString("Toca para liberar", 120, 165);
+            _disp.drawString("Espera para entrar", 120, 180);
+        }
+        // Actualizar solo la cuenta atrás (llamado cada segundo)
+        _disp.fillRect(95, 198, 50, 20, 0x2800);
+        _disp.setTextSize(2);
+        _disp.setTextColor(COL_YELLOW);
+        _disp.setTextDatum(MC_DATUM);
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%d", countdown);
+        _disp.drawString(buf, 120, 208);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Pantalla ESPACIO LIBRE (Bridge conectado)
+    //   Fondo verde oscuro, candado abierto, texto grande "LIBRE",
+    //   nombre del espacio, reloj.
+    // ─────────────────────────────────────────────────────────
+    void drawLibre(const char *timeStr, const char *dateStr, const char *nombre) {
+        _currentState = UI_STATE_LIBRE;
+        // Fondo verde muy oscuro
+        _disp.fillScreen(0x0240);
+
+        // Círculo decorativo
+        _disp.drawCircle(120, 120, 115, COL_GREEN);
+        _disp.drawCircle(120, 120, 113, 0x0320);
+
+        // Candado abierto en verde
+        drawLockIcon(120, 48, COL_GREEN, false);
+
+        // Texto LIBRE grande
+        _disp.setTextSize(3);
+        _disp.setTextColor(COL_GREEN);
+        _disp.setTextDatum(MC_DATUM);
+        _disp.drawString("LIBRE", 120, 108);
+
+        // Hora
+        _disp.setTextSize(2);
+        _disp.setTextColor(COL_WHITE);
+        _disp.drawString(timeStr, 120, 145);
+
+        // Fecha
+        _disp.setTextSize(1);
+        _disp.setTextColor(COL_GRAY);
+        _disp.drawString(dateStr, 120, 168);
+
+        // Nombre del espacio
+        _disp.setTextSize(1);
+        _disp.setTextColor(COL_CYAN);
+        _disp.drawString(nombre, 120, 193);
+    }
+
+    // Actualiza solo hora/fecha en pantalla LIBRE (sin redibujar todo)
+    void updateLibreTime(const char *timeStr, const char *dateStr) {
+        if (_currentState != UI_STATE_LIBRE) return;
+        _disp.fillRect(40, 132, 160, 45, 0x0240);
+        _disp.setTextSize(2);
+        _disp.setTextColor(COL_WHITE);
+        _disp.setTextDatum(MC_DATUM);
+        _disp.drawString(timeStr, 120, 145);
+        _disp.setTextSize(1);
+        _disp.setTextColor(COL_GRAY);
+        _disp.drawString(dateStr, 120, 168);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Pantalla ESPACIO OCUPADO (Bridge conectado)
+    //   Fondo rojo oscuro, candado cerrado, texto grande "OCUPADO",
+    //   nombre del espacio (no se muestra quién está por privacidad).
+    // ─────────────────────────────────────────────────────────
+    void drawOcupado(const char *nombre) {
+        _currentState = UI_STATE_OCUPADO;
+        // Fondo rojo muy oscuro
+        _disp.fillScreen(0x2000);
+
+        // Círculo decorativo
+        _disp.drawCircle(120, 120, 115, COL_RED);
+        _disp.drawCircle(120, 120, 113, 0x3000);
+
+        // Candado cerrado en rojo
+        drawLockIcon(120, 55, COL_RED, true);
+
+        // Texto OCUPADO grande
+        _disp.setTextSize(2);
+        _disp.setTextColor(COL_RED);
+        _disp.setTextDatum(MC_DATUM);
+        _disp.drawString("OCUPADO", 120, 118);
+
+        // Línea separadora
+        _disp.drawLine(60, 140, 180, 140, 0x4000);
+
+        // Nombre del espacio
+        _disp.setTextSize(1);
+        _disp.setTextColor(COL_GRAY);
+        _disp.drawString(nombre, 120, 158);
+
+        // Instrucción: solo el Bridge puede liberar
+        _disp.setTextColor(0x7BEF);
+        _disp.drawString("Espacio en uso", 120, 182);
+        _disp.drawString("Acerca tarjeta para entrar", 120, 200);
     }
 
     // ─────────────────────────────────────────────────────────

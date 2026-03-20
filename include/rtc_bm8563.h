@@ -25,7 +25,7 @@
 // ============================================================
 
 #include <Arduino.h>
-#include <Wire.h>
+#include <M5Dial.h>
 #include "pins_config.h"
 
 // ─────────────────────────────────────────────────────────────
@@ -97,41 +97,36 @@ static inline uint8_t dec2bcd(uint8_t dec) {
 }
 
 // ============================================================
-// Clase KaizenRTC — driver BM8563 para el M5Dial
+// Clase KaizenRTC — wrapper sobre M5Dial.Rtc (RTC_Class de M5Unified)
+//
+// En lugar de acceder al BM8563 directamente por Wire (que usaría el
+// bus Arduino público), delegamos en M5Dial.Rtc que ya fue inicializado
+// por M5Dial.begin() con el bus interno correcto (m5::In_I2C, pines 11/12).
 // ============================================================
 class KaizenRTC {
 public:
 
     // ─────────────────────────────────────────────────────────
-    // Constructor
+    // Constructor — sin dependencia de Wire
     // ─────────────────────────────────────────────────────────
-    KaizenRTC(TwoWire &wirePort = Wire) : _wire(wirePort) {}
+    KaizenRTC() {}
 
     // ─────────────────────────────────────────────────────────
     // Inicialización del RTC
-    //   Devuelve true si el chip responde correctamente.
-    //   Si VL=1 (batería baja o primera puesta en marcha),
-    //   advierte de que hay que ajustar la hora.
+    //   Devuelve true si M5Dial.Rtc está habilitado.
+    //   Si VL=1 (batería baja), graba la hora de compilación
+    //   extraída de los macros __DATE__ / __TIME__.
     // ─────────────────────────────────────────────────────────
     bool begin() {
-        // Verificar que el BM8563 responde en I2C
-        _wire.beginTransmission(BM8563_ADDR);
-        if (_wire.endTransmission() != 0) {
-            return false; // El chip no responde
+        if (!M5Dial.Rtc.isEnabled()) {
+            return false;
         }
 
-        // Limpiar interrupciones y alarmas del registro de control 2
-        writeReg(BM_REG_CTRL2, 0x00);
-
-        // Leer el flag VL para saber si la hora es válida
-        uint8_t secReg = readReg(BM_REG_SECONDS);
-        _voltLow = (secReg & BM_MASK_VL) != 0;
+        _voltLow = M5Dial.Rtc.getVoltLow();
 
         if (_voltLow) {
-            // Primera puesta en marcha o batería descargada:
-            // Establecer una fecha/hora por defecto (20/03/2026 00:00:00)
-            DateTime defaultDT = {2026, 3, 20, 5, 0, 0, 0, false};
-            setDateTime(defaultDT);
+            // Batería baja o primer arranque: usar hora de compilación
+            setBuildTime();
             _voltLow = false;
         }
 
@@ -139,42 +134,49 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────
+    // Forzar la hora del RTC a la hora de compilación del firmware.
+    // Útil para poner en hora manualmente desde setup() si es necesario.
+    // ─────────────────────────────────────────────────────────
+    void setBuildTime() {
+        // __DATE__ = "Mmm DD YYYY"   ej. "Mar 20 2026"
+        // __TIME__ = "HH:MM:SS"      ej. "14:35:00"
+        static const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+        char monStr[4] = {__DATE__[0], __DATE__[1], __DATE__[2], '\0'};
+        int mon = (int)((strstr(months, monStr) - months) / 3) + 1;
+        int day  = atoi(__DATE__ + 4);
+        int year = atoi(__DATE__ + 7);
+        int hour = atoi(__TIME__ + 0);
+        int min  = atoi(__TIME__ + 3);
+        int sec  = atoi(__TIME__ + 6);
+
+        // Calcular día de la semana (algoritmo de Tomohiko Sakamoto)
+        static const int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+        int y = year - (mon < 3 ? 1 : 0);
+        int wday = (y + y/4 - y/100 + y/400 + t[mon-1] + day) % 7;
+
+        m5::rtc_date_t d((int16_t)year, (int8_t)mon, (int8_t)day, (int8_t)wday);
+        m5::rtc_time_t t2((int8_t)hour, (int8_t)min, (int8_t)sec);
+        M5Dial.Rtc.setDateTime(&d, &t2);
+    }
+
+    // ─────────────────────────────────────────────────────────
     // Obtener la fecha y hora actual del RTC
     // ─────────────────────────────────────────────────────────
     DateTime getDateTime() {
         DateTime dt;
+        m5::rtc_date_t d;
+        m5::rtc_time_t t;
 
-        // Leer los 7 registros de tiempo de una vez (burst read)
-        _wire.beginTransmission(BM8563_ADDR);
-        _wire.write(BM_REG_SECONDS);
-        _wire.endTransmission(false); // Repeated START
-        _wire.requestFrom((uint8_t)BM8563_ADDR, (uint8_t)7);
-
-        if (_wire.available() >= 7) {
-            uint8_t rawSec  = _wire.read();
-            uint8_t rawMin  = _wire.read();
-            uint8_t rawHour = _wire.read();
-            uint8_t rawDay  = _wire.read();
-            uint8_t rawWday = _wire.read();
-            uint8_t rawMon  = _wire.read();
-            uint8_t rawYear = _wire.read();
-
-            dt.valid   = !(rawSec & BM_MASK_VL);
-            dt.second  = bcd2dec(rawSec  & BM_MASK_SECONDS);
-            dt.minute  = bcd2dec(rawMin  & BM_MASK_MINUTES);
-            dt.hour    = bcd2dec(rawHour & BM_MASK_HOURS);
-            dt.day     = bcd2dec(rawDay  & BM_MASK_DAY);
-            dt.weekday = bcd2dec(rawWday & BM_MASK_WEEKDAY);
-            dt.month   = bcd2dec(rawMon  & BM_MASK_MONTH);
-
-            // Calcular año completo (BM8563 almacena 0-99)
-            // Si el bit Century=1, el año está en el rango 1900-1999
-            // Si Century=0, está en el rango 2000-2099
-            bool century = (rawMon & BM_MASK_CENTURY) != 0;
-            uint16_t baseYear = century ? 1900 : 2000;
-            dt.year = baseYear + bcd2dec(rawYear);
+        if (M5Dial.Rtc.getDateTime(&d, &t)) {
+            dt.year    = (uint16_t)d.year;
+            dt.month   = (uint8_t)d.month;
+            dt.day     = (uint8_t)d.date;
+            dt.weekday = (uint8_t)d.weekDay;
+            dt.hour    = (uint8_t)t.hours;
+            dt.minute  = (uint8_t)t.minutes;
+            dt.second  = (uint8_t)t.seconds;
+            dt.valid   = !M5Dial.Rtc.getVoltLow();
         } else {
-            // Error de lectura → valores por defecto
             dt = {2026, 3, 20, 5, 0, 0, 0, false};
         }
 
@@ -185,22 +187,10 @@ public:
     // Establecer fecha y hora en el RTC
     // ─────────────────────────────────────────────────────────
     void setDateTime(const DateTime &dt) {
-        _wire.beginTransmission(BM8563_ADDR);
-        _wire.write(BM_REG_SECONDS);
-        _wire.write(dec2bcd(dt.second)  & BM_MASK_SECONDS); // Limpia VL
-        _wire.write(dec2bcd(dt.minute)  & BM_MASK_MINUTES);
-        _wire.write(dec2bcd(dt.hour)    & BM_MASK_HOURS);
-        _wire.write(dec2bcd(dt.day)     & BM_MASK_DAY);
-        _wire.write(dec2bcd(dt.weekday) & BM_MASK_WEEKDAY);
-
-        // Mes: determinar bit de century según el año
-        uint8_t monthByte = dec2bcd(dt.month) & BM_MASK_MONTH;
-        if (dt.year < 2000) monthByte |= BM_MASK_CENTURY;
-        _wire.write(monthByte);
-
-        // Año: guardar solo los dos últimos dígitos en BCD
-        _wire.write(dec2bcd(dt.year % 100));
-        _wire.endTransmission();
+        m5::rtc_date_t d((int16_t)dt.year, (int8_t)dt.month,
+                         (int8_t)dt.day,  (int8_t)dt.weekday);
+        m5::rtc_time_t t((int8_t)dt.hour, (int8_t)dt.minute, (int8_t)dt.second);
+        M5Dial.Rtc.setDateTime(&d, &t);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -267,28 +257,5 @@ public:
     bool isVoltLow() const { return _voltLow; }
 
 private:
-    TwoWire &_wire;
-    bool     _voltLow = false;
-
-    // ─────────────────────────────────────────────────────────
-    // Escritura de un registro I2C
-    // ─────────────────────────────────────────────────────────
-    void writeReg(uint8_t reg, uint8_t value) {
-        _wire.beginTransmission(BM8563_ADDR);
-        _wire.write(reg);
-        _wire.write(value);
-        _wire.endTransmission();
-    }
-
-    // ─────────────────────────────────────────────────────────
-    // Lectura de un registro I2C
-    // ─────────────────────────────────────────────────────────
-    uint8_t readReg(uint8_t reg) {
-        _wire.beginTransmission(BM8563_ADDR);
-        _wire.write(reg);
-        _wire.endTransmission(false);
-        _wire.requestFrom((uint8_t)BM8563_ADDR, (uint8_t)1);
-        if (_wire.available()) return _wire.read();
-        return 0x00;
-    }
+    bool _voltLow = false;
 };

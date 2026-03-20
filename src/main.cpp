@@ -70,6 +70,7 @@
 #include "pins_config.h"      // Definición de pines GPIO del M5Dial
 #include "ui_display.h"       // Módulo de interfaz gráfica TFT
 #include "rtc_bm8563.h"       // Módulo RTC BM8563
+#include "espnow_kaizen.h"    // Comunicación ESP-NOW con el Bridge
 
 // ─────────────────────────────────────────────────────────────
 // CONSTANTES DE CONFIGURACIÓN
@@ -124,8 +125,8 @@ char master2[9] = {'8','8','0','4','0','2','2','0','\0'};
 // NUEVO — Pantalla TFT del M5Dial (M5GFX gestionada por BSP)
 KaizenUI ui(M5Dial.Display);
 
-// NUEVO — RTC BM8563 (bus Wire compartido con RFID)
-KaizenRTC rtc(Wire);
+// NUEVO — RTC BM8563 (delegado en M5Dial.Rtc, ya inicializado por el BSP)
+KaizenRTC rtc;
 
 // ─────────────────────────────────────────────────────────────
 // PROTOTIPOS DE FUNCIONES
@@ -194,17 +195,11 @@ void setup() {
     // M5Dial.begin() ya inicializa el bus I2C interno con los pines correctos.
     // El RTC BM8563 comparte ese mismo bus. Wire queda listo para usarse.
 
-    // ── Configuración del relé y pulsador de puerta
-    // CAMBIO respecto al original: GPIO5→GPIO1, GPIO4→GPIO2
-    // Los nuevos GPIOs corresponden al header P3 del M5Dial
+    // ── Configuración del relé
+    // CAMBIO respecto al original: GPIO5→GPIO1 (header P3 del M5Dial)
+    // No hay pulsador de puerta en esta versión.
     pinMode(RELE, OUTPUT);
     digitalWrite(RELE, LOW); // Relé normalmente abierto (NO activo)
-
-    // MANTENIDO: espera a que el pulsador esté liberado antes de continuar
-    pinMode(PULSADOR_PUERTA, INPUT_PULLUP);
-    while (digitalRead(PULSADOR_PUERTA) == LOW) {
-        delay(10); // Anti-rebote
-    }
 
     // ── Configuración del buzzer (LEDC PWM del ESP32-S3)
     // NUEVO: reemplaza todos los Pulsos_* que usaban el relé como buzzer
@@ -232,11 +227,11 @@ void setup() {
         Buzzer_AccessDeny();
         delay(3000);
         // El sistema continúa sin RTC (sin timestamps ni control horario)
-    } else if (rtc.isVoltLow()) {
-        // Si la batería del RTC estaba baja, se ha puesto la hora por defecto
-        // En una versión mejorada, aquí se podría pedir al usuario que ajuste la hora
-        ui.drawError("Ajuste la hora RTC");
-        delay(2000);
+    } else {
+        // Forzar hora de compilación en este flash para poner en hora el RTC.
+        // Una vez el RTC tenga la hora correcta y la batería esté cargada,
+        // se puede eliminar esta línea para que la hora persista entre reinicios.
+        rtc.setBuildTime();
     }
 
     // ── Módulo RFID
@@ -254,7 +249,7 @@ void setup() {
     // ── Inicialización de matrículas (chapuza del arranque original, mantenida)
     // Asegura que la EEPROM tenga al menos la matrícula maestra de respaldo
     habilitarMatricula("88040220");
-    RemoveMatricula("88040220");
+    { char _m[] = "88040220"; RemoveMatricula(_m); }
     habilitarMatricula("88040220");
 
     // ── Mostrar matrículas habilitadas por consola serie (solo depuración)
@@ -262,6 +257,27 @@ void setup() {
     Serial.begin(115200);
     Serial.println("=== Cerradura Kaizen M5Dial ===");
     MostrarMatriculasHabilitadas();
+
+    // ── Comunicación ESP-NOW con el Bridge
+    // Registrar callback para cuando el Bridge envíe lista de matrículas (KAIZEN_CONFIG)
+    kaizen_setConfigCallback([](const uint8_t *mats, uint8_t n, const char *nombre) {
+        // Sincronizar EEPROM con la lista de matrículas del Bridge
+        EEPROM.write(0, 0);
+        EEPROM.commit();
+        for (uint8_t i = 0; i < n && i < MAX_MATRICULAS; i++) {
+            char m[9];
+            memcpy(m, mats + i * 8, 8);
+            m[8] = '\0';
+            habilitarMatricula(String(m));
+        }
+        Serial.printf("[BRIDGE] Matrículas sincronizadas: %u\n", n);
+        (void)nombre; // nombre ya guardado en _kNombre por el módulo
+    });
+    if (!kaizen_begin()) {
+        ui.drawError("Fallo ESP-NOW");
+        delay(2000);
+        // El sistema continúa en modo local (EEPROM) sin conectividad
+    }
 
     // ── Pantalla de espera inicial
     ActualizarPantallaIdle();
@@ -274,19 +290,21 @@ void loop() {
     // ── Actualizar M5Dial (encoder, touch, IMU)
     M5Dial.update();
 
-    // ── Actualizar pantalla de reloj cada segundo (si estamos en idle)
-    if (millis() - ultimaActualizacionHora > INTERVALO_HORA_MS) {
-        ultimaActualizacionHora = millis();
-        if (ui.getState() == UI_STATE_IDLE) {
-            ActualizarPantallaIdle();
-        }
+    // ── Procesar mensajes ESP-NOW del Bridge
+    kaizen_tick();
+
+    // ── Si el estado del espacio cambió (Bridge liberó/ocupó, o timeout)
+    if (kaizen_hayEstadoCambio()) {
+        ActualizarPantallaIdle();
     }
 
-    // ── Verificar pulsador de puerta (apertura manual sin RFID)
-    // MANTENIDO del código original
-    if (digitalRead(PULSADOR_PUERTA) == LOW) {
-        AbrirCerradura();
-        delay(200); // Anti-rebote
+    // ── Actualizar reloj cada segundo en pantallas que lo muestran
+    if (millis() - ultimaActualizacionHora > INTERVALO_HORA_MS) {
+        ultimaActualizacionHora = millis();
+        UIState s = ui.getState();
+        if (s == UI_STATE_IDLE || s == UI_STATE_LIBRE) {
+            ActualizarPantallaIdle();
+        }
     }
 
     // ── Leer tarjeta RFID
@@ -310,39 +328,96 @@ void loop() {
     // ─────────────────────────────────────────────────────────
 
     if (SonIguales(matricula, master) || SonIguales(matricula, master2)) {
-        // ── Tarjeta maestra → abrir cerradura
-        // NUEVO: también verifica franja horaria si está habilitada
+        // ── Tarjeta maestra → abre siempre; en modo estado libera si está ocupado
         DateTime ahora = rtc.getDateTime();
         if (rtc.isAccessAllowed(ahora, franjaAcceso)) {
             char ts[20];
             rtc.formatTime(ahora, ts, sizeof(ts));
             ui.drawAccessOK("MASTER", ts);
             Buzzer_AccessOK();
+            if (kaizen_isBridgeOK() && kaizen_isModoEstado() &&
+                kaizen_getEstado() == EstadoEspacio::OCUPADO) {
+                kaizen_marcarLibre();
+            }
+            kaizen_registrarEvento(KaizenEvento::ACCESO_OK, master, millis());
             AbrirCerradura();
         } else {
             char ts[20];
             rtc.formatTime(ahora, ts, sizeof(ts));
             ui.drawAccessDeny("MASTER (HORARIO)", ts);
             Buzzer_AccessDeny();
+            kaizen_registrarEvento(KaizenEvento::ACCESO_DENEGADO, master, millis());
             delay(2000);
         }
 
     } else if (Habilitado(matricula)) {
-        // ── Tarjeta habilitada → acceso
         DateTime ahora = rtc.getDateTime();
         if (rtc.isAccessAllowed(ahora, franjaAcceso)) {
             char ts[20];
             rtc.formatTime(ahora, ts, sizeof(ts));
-            // NUEVO: muestra matrícula y hora en pantalla de acceso OK
-            // antes era solo Serial.println("Abrir")
-            ui.drawAccessOK(matricula, ts);
-            Buzzer_AccessOK();
-            AbrirCerradura();
+
+            bool modoEstado = kaizen_isBridgeOK() && kaizen_isModoEstado();
+
+            if (modoEstado && kaizen_getEstado() == EstadoEspacio::OCUPADO) {
+                // ── Modo estado + espacio OCUPADO
+                if (strncmp(matricula, kaizen_getOcupante(), 8) == 0) {
+                    // Misma persona que ocupó: preguntar si quiere liberar o entrar de nuevo
+                    // Countdown de 3 segundos con pantalla de confirmación.
+                    // Touch o BtnA = libera; timeout = entra de nuevo.
+                    ui.drawConfirmRelease(3, true);
+                    bool liberar = false;
+                    uint32_t limite = millis() + 3000;
+                    uint32_t sigSegundo = millis() + 1000;
+                    int countdown = 3;
+                    while (millis() < limite && !liberar) {
+                        M5Dial.update();
+                        if (M5Dial.BtnA.wasPressed() || M5Dial.Touch.getDetail().wasPressed()) {
+                            liberar = true;
+                        }
+                        if (millis() > sigSegundo) {
+                            countdown--;
+                            ui.drawConfirmRelease(countdown, false);
+                            sigSegundo += 1000;
+                        }
+                        vTaskDelay(10);
+                    }
+                    if (liberar) {
+                        // Libera el espacio + abre
+                        ui.drawAccessOK(matricula, ts);
+                        Buzzer_AccessOK();
+                        kaizen_marcarLibre();
+                        kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
+                    } else {
+                        // Entra de nuevo, espacio sigue OCUPADO por la misma persona
+                        ui.drawAccessOK(matricula, ts);
+                        Buzzer_AccessOK();
+                        kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
+                    }
+                    AbrirCerradura();
+                } else {
+                    // Persona diferente → solo abre, estado sigue OCUPADO
+                    ui.drawAccessOK(matricula, ts);
+                    Buzzer_AccessOK();
+                    kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
+                    AbrirCerradura();
+                }
+            } else {
+                // ── Solo acceso, o modo estado con espacio LIBRE → acceso normal
+                ui.drawAccessOK(matricula, ts);
+                Buzzer_AccessOK();
+                if (modoEstado) {
+                    // Espacio estaba LIBRE → pasa a OCUPADO con esta persona
+                    kaizen_marcarOcupado(matricula);
+                }
+                kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
+                AbrirCerradura();
+            }
         } else {
             char ts[20];
             rtc.formatTime(ahora, ts, sizeof(ts));
             ui.drawAccessDeny(matricula, ts);
             Buzzer_AccessDeny();
+            kaizen_registrarEvento(KaizenEvento::ACCESO_DENEGADO, matricula, millis());
             delay(2000);
         }
 
@@ -351,13 +426,12 @@ void loop() {
         DateTime ahora = rtc.getDateTime();
         char ts[20];
         rtc.formatTime(ahora, ts, sizeof(ts));
-        // NUEVO: muestra mensaje en pantalla + buzzer
-        // antes era solo Serial.println("No abre")
         ui.drawAccessDeny(matricula, ts);
         Buzzer_AccessDeny();
+        kaizen_registrarEvento(KaizenEvento::ACCESO_DENEGADO, matricula, millis());
         delay(2000);
-        ActualizarPantallaIdle(); // Volver a idle tras el rechazo
-        return; // No entrar en modo gestión con tarjeta desconocida
+        ActualizarPantallaIdle();
+        return;
     }
 
     // ─────────────────────────────────────────────────────────
@@ -621,7 +695,7 @@ void ReadEmpleado(char *empleado) {
     // ── Autenticar con el bloque 4, clave A
     // MANTENIDA del código original: mismo bloque, mismo comando
     byte block = 4;
-    MFRC522::StatusCode status = M5Dial.Rfid.PCD_Authenticate(
+    MFRC522::StatusCode status = (MFRC522::StatusCode)M5Dial.Rfid.PCD_Authenticate(
         MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(M5Dial.Rfid.uid)
     );
 
@@ -637,7 +711,7 @@ void ReadEmpleado(char *empleado) {
     // MANTENIDA del código original: mismo buffer, mismo bloque
     byte buffer1[18];
     byte len = 18;
-    status = M5Dial.Rfid.MIFARE_Read(block, buffer1, &len);
+    status = (MFRC522::StatusCode)M5Dial.Rfid.MIFARE_Read(block, buffer1, &len);
 
     if (status != MFRC522::STATUS_OK) {
         Serial.printf("[RFID] Error lectura: %s\n",
@@ -854,12 +928,28 @@ void ActualizarPantallaIdle() {
     rtc.formatTime(ahora, timeStr, sizeof(timeStr));
     rtc.formatDate(ahora, dateStr, sizeof(dateStr));
 
-    if (ui.getState() == UI_STATE_IDLE) {
-        // Ya en idle → solo actualizar zona de texto (sin redibujar todo)
-        ui.updateIdleTime(timeStr, dateStr);
+    // Si el Bridge está conectado Y el espacio tiene modo estado, mostrar LIBRE/OCUPADO
+    if (kaizen_isBridgeOK() && kaizen_isModoEstado()) {
+        if (kaizen_getEstado() == EstadoEspacio::OCUPADO) {
+            if (ui.getState() != UI_STATE_OCUPADO) {
+                ui.drawOcupado(kaizen_getNombre());
+            }
+            // OCUPADO no tiene reloj → no hacer update parcial
+        } else {
+            // LIBRE con reloj
+            if (ui.getState() == UI_STATE_LIBRE) {
+                ui.updateLibreTime(timeStr, dateStr);
+            } else {
+                ui.drawLibre(timeStr, dateStr, kaizen_getNombre());
+            }
+        }
     } else {
-        // Venimos de otra pantalla → redibujar la pantalla completa de idle
-        ui.drawIdle(timeStr, dateStr);
+        // Sin Bridge: comportamiento original (reloj + candado)
+        if (ui.getState() == UI_STATE_IDLE) {
+            ui.updateIdleTime(timeStr, dateStr);
+        } else {
+            ui.drawIdle(timeStr, dateStr);
+        }
     }
 }
 
