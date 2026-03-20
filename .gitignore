@@ -1,0 +1,26 @@
+# ── PlatformIO ──────────────────────────────────────────────
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_format
+.clangd/
+
+# ── VS Code ──────────────────────────────────────────────────
+.vscode/
+
+# ── Build outputs ────────────────────────────────────────────
+build/
+*.bin
+*.elf
+*.map
+*.lst
+
+# ── Sistema operativo ────────────────────────────────────────
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ── Archivo original (Arduino IDE) ──────────────────────────
+# Se conserva como referencia histórica pero se excluye del build activo
+# Descomenta la siguiente línea si prefieres no incluirlo en el repo:
+# AccesoKaizen.ino
