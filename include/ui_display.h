@@ -463,6 +463,36 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────
+    // drawBridgeIndicator — indicador LED de conexión con el Bridge
+    //   Dibuja un pequeño punto de color en la esquina superior
+    //   derecha de la pantalla (dentro del arco visible GC9A01).
+    //
+    //   connected=true  → punto verde  (Bridge ok)
+    //   connected=false → punto gris   (Sin cobertura / timeout)
+    //
+    //   Llamar DESPUÉS de dibujar la pantalla base para que
+    //   el indicador quede siempre en primer plano.
+    // ─────────────────────────────────────────────────────────
+    void drawBridgeIndicator(bool connected) {
+        // Posición: esquina superior derecha, dentro de la circunferencia
+        // (182, 30) → ~111 px del centro, dentro del radio visible de 115 px
+        const int cx = 182, cy = 30, r = 5;
+
+        // Limpiar área previa con el color de fondo correspondiente al estado
+        uint16_t bg = COL_BG_BLACK;
+        if (_currentState == UI_STATE_LIBRE)   bg = 0x0240; // verde oscuro
+        if (_currentState == UI_STATE_OCUPADO) bg = 0x2000; // rojo oscuro
+        _disp.fillRect(cx - r - 3, cy - r - 3, (r + 3) * 2, (r + 3) * 2, bg);
+
+        // Punto principal: verde=conectado, gris=sin Bridge
+        uint16_t col = connected ? COL_GREEN : COL_GRAY;
+        _disp.fillCircle(cx, cy, r, col);
+
+        // Destello interior más claro para efecto de profundidad
+        _disp.fillCircle(cx - 1, cy - 1, r / 2, connected ? 0x87F0 : 0xBDF7);
+    }
+
+    // ─────────────────────────────────────────────────────────
     // Devuelve el estado actual de la UI
     // ─────────────────────────────────────────────────────────
     UIState getState() const { return _currentState; }

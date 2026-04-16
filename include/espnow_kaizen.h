@@ -27,6 +27,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_idf_version.h>
+#include <Preferences.h>
 
 extern "C" {
 #include "esp_wifi.h"
@@ -93,7 +94,7 @@ struct KaizenMsg {
 #define KAIZEN_WIFI_CHANNEL      1
 #define KAIZEN_MAX_EVENTOS       8
 #define KAIZEN_TIMEOUT_BRIDGE_MS 120000UL  // 2 min sin mensaje → sin cobertura
-#define KAIZEN_FIRMWARE_VERSION  1
+#define KAIZEN_FIRMWARE_VERSION  2  // v2: persistencia de estado en NVS (Preferences)
 #define KAIZEN_TIMEOUT_SEND_MS   2000
 
 // ─────────────────────────────────────────────────────────────
@@ -107,6 +108,7 @@ typedef void (*KaizenConfigCb)(const uint8_t *mats, uint8_t n, const char *nombr
 // ============================================================
 // Variables internas del módulo (prefijo _ = privadas)
 // ============================================================
+static Preferences           _kPrefs;
 static EstadoEspacio         _kEstado         = EstadoEspacio::LIBRE;
 static char                  _kNombre[32]     = "Sin config";
 static char                  _kOcupante[9]    = {0};
@@ -130,6 +132,28 @@ static uint8_t           _kSeqEsperada = 0;
 static bool              _kPrimerACK   = true;
 
 static KaizenConfigCb    _kCbConfig    = nullptr;
+
+// ─────────────────────────────────────────────────────────────
+// Persistencia NVS del estado del espacio
+// ─────────────────────────────────────────────────────────────
+static void _kNvsSave() {
+    _kPrefs.begin("kaizen", false);
+    _kPrefs.putUChar("estado",   (uint8_t)_kEstado);
+    _kPrefs.putString("ocupante", _kOcupante);
+    _kPrefs.end();
+}
+
+static void _kNvsLoad() {
+    _kPrefs.begin("kaizen", true); // read-only
+    _kEstado = (EstadoEspacio)_kPrefs.getUChar("estado", (uint8_t)EstadoEspacio::LIBRE);
+    String ocp = _kPrefs.getString("ocupante", "");
+    strncpy(_kOcupante, ocp.c_str(), 8);
+    _kOcupante[8] = '\0';
+    _kPrefs.end();
+    Serial.printf("[NVS] Estado restaurado: %s  Ocupante: '%s'\n",
+                  _kEstado == EstadoEspacio::OCUPADO ? "OCUPADO" : "LIBRE",
+                  _kOcupante);
+}
 
 // ─────────────────────────────────────────────────────────────
 // Compatibilidad IDF v4/v5 para los callbacks de ESP-NOW
@@ -319,7 +343,7 @@ static void _kProcesar() {
             EstadoEspacio prev = _kEstado;
             _kEstado = EstadoEspacio::LIBRE;
             memset(_kOcupante, 0, sizeof(_kOcupante));
-            if (prev != _kEstado) _kEstadoCambio = true;
+            if (prev != _kEstado) { _kEstadoCambio = true; _kNvsSave(); }
             Serial.println("[BRIDGE] Espacio liberado por Bridge");
             _kResponder(K_OK);
             break;
@@ -334,7 +358,7 @@ static void _kProcesar() {
                 memcpy(_kOcupante, _kMsgIn.data, 8);
                 _kOcupante[8] = '\0';
             }
-            if (prev != _kEstado) _kEstadoCambio = true;
+            if (prev != _kEstado) { _kEstadoCambio = true; _kNvsSave(); }
             Serial.println("[BRIDGE] Espacio ocupado por Bridge");
             _kResponder(K_OK);
             break;
@@ -366,6 +390,9 @@ static void _kProcesar() {
 //   Devuelve false si ESP-NOW no pudo iniciarse.
 // ─────────────────────────────────────────────────────────────
 bool kaizen_begin() {
+    _kNvsLoad(); // Restaurar estado del espacio desde NVS
+    _kEstadoCambio = true; // Forzar redibujado con el estado restaurado
+
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(true, true);
 
@@ -419,6 +446,7 @@ void kaizen_marcarOcupado(const char *matricula) {
     strncpy(_kOcupante, matricula, 8);
     _kOcupante[8] = '\0';
     _kEstadoCambio = true;
+    _kNvsSave();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -428,6 +456,7 @@ void kaizen_marcarLibre() {
     _kEstado = EstadoEspacio::LIBRE;
     memset(_kOcupante, 0, sizeof(_kOcupante));
     _kEstadoCambio = true;
+    _kNvsSave();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -451,6 +480,20 @@ bool          kaizen_isBridgeOK()      { return _kBridgeOK; }
 bool          kaizen_isModoEstado()    { return _kModoEstado; }
 const char*   kaizen_getNombre()       { return _kNombre; }
 const char*   kaizen_getOcupante()     { return _kOcupante; }
+
+// ─────────────────────────────────────────────────────────────
+// kaizen_tiempoSinBridge — milisegundos transcurridos desde el
+//   último mensaje recibido del Bridge.
+//   - Devuelve 0           si _kBridgeOK es true (hay cobertura).
+//   - Devuelve UINT32_MAX  si nunca se ha recibido ningún mensaje.
+//   - Devuelve el tiempo real si el Bridge se ha perdido por timeout.
+//   Útil para mostrar en pantalla o para lógica de reintentos.
+// ─────────────────────────────────────────────────────────────
+uint32_t kaizen_tiempoSinBridge() {
+    if (_kBridgeOK)       return 0;          // Conectado — sin tiempo perdido
+    if (_kTUltimoMsg == 0) return UINT32_MAX; // Nunca hubo contacto
+    return millis() - _kTUltimoMsg;
+}
 
 // Devuelve true UNA sola vez cuando el estado cambió desde la última consulta
 bool kaizen_hayEstadoCambio() {

@@ -951,6 +951,10 @@ void ActualizarPantallaIdle() {
             ui.drawIdle(timeStr, dateStr);
         }
     }
+
+    // Indicador LED de conexión Bridge (esquina superior derecha)
+    // Visible en todas las pantallas de espera: IDLE, LIBRE y OCUPADO
+    ui.drawBridgeIndicator(kaizen_isBridgeOK());
 }
 
 // ─────────────────────────────────────────────────────────────
