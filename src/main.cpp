@@ -67,6 +67,10 @@
 #include <M5Dial.h>           // BSP M5Dial: incluye soporte RFID, pantalla, RTC, etc.
 #include <EEPROM.h>           // Emulación EEPROM en flash del ESP32-S3
 
+extern "C" {
+#include "esp_wifi.h"         // esp_wifi_get_mac — para mostrar la MAC antes del Bridge
+}
+
 #include "pins_config.h"      // Definición de pines GPIO del M5Dial
 #include "ui_display.h"       // Módulo de interfaz gráfica TFT
 #include "rtc_bm8563.h"       // Módulo RTC BM8563
@@ -277,6 +281,20 @@ void setup() {
         ui.drawError("Fallo ESP-NOW");
         delay(2000);
         // El sistema continúa en modo local (EEPROM) sin conectividad
+    }
+
+    // Imprimir MAC en pantalla y serie para facilitar el registro en el Bridge
+    {
+        uint8_t mac[6];
+        if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+            Serial.printf("[ESPNOW] MAC STA: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            char macStr[18];
+            snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            // Mostrar MAC en pantalla mientras no hay Bridge
+            ui.drawIdle("--:--", macStr);
+        }
     }
 
     // ── Pantalla de espera inicial

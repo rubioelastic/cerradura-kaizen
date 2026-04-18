@@ -13,22 +13,27 @@ GO
 -- ============================================================
 -- TABLA: espacios
 --   Cada fila representa un M5Dial / espacio físico.
---   El Bridge identifica el dispositivo por su MAC.
+--   El Bridge identifica el dispositivo por su MAC_ESP32.
 -- ============================================================
 CREATE TABLE espacios (
-    id               INT            IDENTITY(1,1)  NOT NULL,
-    mac              CHAR(17)                       NOT NULL,   -- 'XX:XX:XX:XX:XX:XX'
-    nombre           NVARCHAR(32)                   NOT NULL,   -- asignado por Bridge en KAIZEN_CONFIG
-    estado           TINYINT        NOT NULL DEFAULT 0,          -- 0=LIBRE  1=OCUPADO
-    ocupante         CHAR(8)                        NULL,        -- matrícula actual (NULL si LIBRE)
-    modo_estado      BIT            NOT NULL DEFAULT 0,          -- 0=solo acceso  1=acceso+estado
-    firmware_version INT            NOT NULL DEFAULT 1,
-    ultimo_sync      DATETIME2(0)                   NULL,        -- último KAIZEN_SYNC recibido
-    bridge_ok        BIT            NOT NULL DEFAULT 0,          -- 1 si Bridge responde en <2 min
-    created_at       DATETIME2(0)   NOT NULL DEFAULT SYSUTCDATETIME(),
+    id                        INT            IDENTITY(1,1)  NOT NULL,
+    MAC_ESP32                 CHAR(12)                       NOT NULL,  -- MAC WiFi STA del M5Dial sin separadores  'XXXXXXXXXXXX'
+    MACBridge                 CHAR(12)                       NULL,      -- MAC del Bridge que gestiona este espacio (sin separadores)
+    Denominacion              NVARCHAR(32)                   NOT NULL,  -- asignado por Bridge en KAIZEN_CONFIG
+    Operativo                 BIT            NOT NULL DEFAULT 0,        -- 1 si el dispositivo responde (Bridge en <2 min)
+    estado                    TINYINT        NOT NULL DEFAULT 0,        -- 0=LIBRE  1=OCUPADO
+    ocupante                  CHAR(8)                        NULL,      -- matrícula actual (NULL si LIBRE)
+    modo_estado               BIT            NOT NULL DEFAULT 0,        -- 0=solo acceso  1=acceso+estado
+    VersionFirmwareEjecutada  INT            NOT NULL DEFAULT 1,        -- versión que corre actualmente el ESP
+    VersionFirmwareRequerida  INT            NOT NULL DEFAULT 1,        -- versión mínima que exige el Bridge (OTA)
+    Debug                     BIT            NOT NULL DEFAULT 0,        -- 1 = modo verbose activado por el Bridge
+    LifeSignal                DATETIME2(0)                   NULL,      -- último KAIZEN_SYNC / KAIZEN_COMPLETO recibido
+    created_at                DATETIME2(0)   NOT NULL DEFAULT SYSUTCDATETIME(),
+    MapaX                     FLOAT                          NULL,      -- coordenada X en el plano del edificio
+    MapaY                     FLOAT                          NULL,      -- coordenada Y en el plano del edificio
 
     CONSTRAINT PK_espacios        PRIMARY KEY (id),
-    CONSTRAINT UQ_espacios_mac    UNIQUE      (mac),
+    CONSTRAINT UQ_espacios_mac    UNIQUE      (MAC_ESP32),
     CONSTRAINT CK_espacios_estado CHECK       (estado IN (0, 1))
 );
 GO
@@ -69,7 +74,7 @@ CREATE TABLE eventos_acceso (
     id_espacio   INT                          NOT NULL,
     tipo         TINYINT                      NOT NULL,
     matricula    CHAR(8)                      NULL,        -- NULL en APERTURA_MANUAL
-    millis_fw    BIGINT                       NOT NULL,    -- millis() crudo del ESP (relativo, no es hora real)
+    millis_fw    BIGINT                       NOT NULL,    -- lo asigna el Bridge (0 o su propio contador); el firmware ya no lo envía
     created_at   DATETIME2(0)  NOT NULL DEFAULT SYSUTCDATETIME(),  -- hora real del servidor
 
     CONSTRAINT PK_eventos          PRIMARY KEY (id),
@@ -122,6 +127,6 @@ GO
 -- DATOS INICIALES DE EJEMPLO
 --   Adapta la MAC y el nombre antes de ejecutar.
 -- ============================================================
-INSERT INTO espacios (mac, nombre, modo_estado)
-VALUES ('3C:DC:75:EE:50:88', 'Sala Kaizen A', 1);
+INSERT INTO espacios (MAC_ESP32, Denominacion, modo_estado)
+VALUES ('3CDC75EE5088', 'Sala Kaizen A', 1);
 GO

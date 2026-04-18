@@ -28,6 +28,8 @@
 #include <esp_now.h>
 #include <esp_idf_version.h>
 #include <Preferences.h>
+#include <Update.h>            // OTA via ESP-NOW (mismo protocolo que ReactionTime)
+#include <esp_task_wdt.h>     // hard_reset via watchdog
 
 extern "C" {
 #include "esp_wifi.h"
@@ -40,6 +42,20 @@ extern "C" {
 #define KAIZEN_CONFIG   0x0C01  // Nombre espacio + lista matrículas autorizadas
 #define KAIZEN_LIBERAR  0x0C02  // Fuerza estado LIBRE (fin ensayo, etc.)
 #define KAIZEN_OCUPAR   0x0C03  // Fuerza estado OCUPADO desde RNA
+#define KAIZEN_COMPLETO 0x00B0  // Mensaje único cíclico (reemplaza SYNC+CONFIG+LIBERAR+OCUPAR)
+                                //   data recibida: flags(1) + tiempo_ms(4LE) + id(4LE) +
+                                //                  n_mats(1) + mats(n×8) + len_nombre(1) + nombre
+                                //   flags bit0: estado forzado (0=LIBRE,1=OCUPADO)
+                                //   flags bit1: modo_estado activo
+                                //
+                                //   respuesta OK — formato compatible Bridge/ReactionTime:
+                                //     mix(1) + n_accesos(1) + [mat(8)] × n_accesos
+                                //     mix bit0 = estado actual (0=LIBRE, 1=OCUPADO)
+                                //     mix bit1 = nombre configurado
+                                //     mix bit2 = hubo apertura manual en este ciclo
+                                //     mix bit3 = hubo acceso denegado en este ciclo
+                                //   Solo se envían matriculas de ACCESO_OK (8 bytes c/u).
+                                //   APERTURA_MANUAL y ACCESO_DENEGADO se notifican via mix bits.
 
 // Comandos del protocolo base (reutilizados de TRM)
 #define K_OK            0xFFFE
@@ -133,6 +149,11 @@ static bool              _kPrimerACK   = true;
 
 static KaizenConfigCb    _kCbConfig    = nullptr;
 
+// ── OTA via ESP-NOW
+static uint32_t          _kOtaTotal    = 0;
+static uint32_t          _kOtaProgress = 0;
+static bool              _kOtaStarted  = false;
+
 // ─────────────────────────────────────────────────────────────
 // Persistencia NVS del estado del espacio
 // ─────────────────────────────────────────────────────────────
@@ -153,6 +174,21 @@ static void _kNvsLoad() {
     Serial.printf("[NVS] Estado restaurado: %s  Ocupante: '%s'\n",
                   _kEstado == EstadoEspacio::OCUPADO ? "OCUPADO" : "LIBRE",
                   _kOcupante);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reset forzado via watchdog (idéntico a ReactionTime)
+// ─────────────────────────────────────────────────────────────
+static void _kHardReset() {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_task_wdt_config_t cfg = { .timeout_ms = 1000, .idle_core_mask = 0, .trigger_panic = true };
+    esp_task_wdt_deinit();
+    ESP_ERROR_CHECK(esp_task_wdt_init(&cfg));
+#else
+    ESP_ERROR_CHECK(esp_task_wdt_init(1, true));
+#endif
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+    while (true) {}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -258,23 +294,30 @@ static void _kProcesar() {
         if (_kSeqEsperada == 0) _kSeqEsperada++;
     }
 
+    Serial.printf("[ESPNOW] RX cmd=0x%04X seq=%u/%u len=%u\n",
+                  _kMsgIn.comando, _kMsgIn.seq, _kSeqEsperada, _kLenMsgIn);
+
     if (_kMsgIn.seq != _kSeqEsperada && _kMsgIn.seq != 0) {
         uint8_t seqPrev = _kSeqEsperada - 1;
         if (seqPrev == 0) seqPrev--;
         if (seqPrev == _kMsgIn.seq || _kMsgIn.seq == 0) {
-            // Reenviar último mensaje
+            Serial.printf("[ESPNOW] SEQ duplicada (%u), reenviando ultimo mensage\n", _kMsgIn.seq);
             _kMsgEnviado = false;
             esp_now_send(_kMacBridge, (uint8_t *)&_kMsgResp, _kLenMsgResp);
             uint32_t lim = millis() + KAIZEN_TIMEOUT_SEND_MS;
             while (!_kMsgEnviado && millis() < lim) vTaskDelay(5);
         } else {
+            Serial.printf("[ESPNOW] BAD_SEQ recibida=%u esperada=%u\n", _kMsgIn.seq, _kSeqEsperada);
             _kResponder(K_BAD_SECUENCE, _kSeqEsperada);
         }
         return;
     }
 
     // ── CRC
-    if (_kMsgIn.crc != _kCalcCRC(_kMsgIn, _kLenMsgIn)) {
+    uint8_t crcCalc = _kCalcCRC(_kMsgIn, _kLenMsgIn);
+    if (_kMsgIn.crc != crcCalc) {
+        Serial.printf("[ESPNOW] BAD_CRC recibido=0x%02X calculado=0x%02X\n",
+                      _kMsgIn.crc, crcCalc);
         _kResponder(K_BAD_CRC, _kSeqEsperada);
         return;
     }
@@ -364,6 +407,72 @@ static void _kProcesar() {
             break;
         }
 
+        case KAIZEN_COMPLETO: {
+            // ── Desempaquetar flags
+            uint8_t  flags     = _kMsgIn.data[0];
+            bool     forzarOcupado = (flags & 0x01) != 0;
+            _kModoEstado           = (flags & 0x02) != 0;
+
+            // ── Tiempo y reserva (little-endian, info para futuros usos)
+            // uint32_t tiempoMs = ...; // data[1..4] — no usado localmente aún
+            // uint32_t reservaId = ...; // data[5..8]
+
+            // ── Lista de matrículas autorizadas
+            uint8_t  nMats  = _kMsgIn.data[9];
+            uint16_t cursor = 10;
+            if (_kCbConfig) {
+                _kCbConfig(&_kMsgIn.data[cursor], nMats, _kNombre); // nombre aún no leído
+            }
+            cursor += nMats * 8;
+
+            // ── Nombre del espacio
+            uint8_t lenNombre = _kMsgIn.data[cursor];
+            if (lenNombre > 31) lenNombre = 31;
+            if (lenNombre > 0) {
+                memcpy(_kNombre, &_kMsgIn.data[cursor + 1], lenNombre);
+                _kNombre[lenNombre] = '\0';
+            }
+
+            // ── Aplicar estado forzado del Bridge
+            EstadoEspacio estadoBridge = forzarOcupado ? EstadoEspacio::OCUPADO : EstadoEspacio::LIBRE;
+            if (estadoBridge != _kEstado) {
+                _kEstado = estadoBridge;
+                if (!forzarOcupado) memset(_kOcupante, 0, sizeof(_kOcupante));
+                _kEstadoCambio = true;
+                _kNvsSave();
+                Serial.printf("[BRIDGE] Estado forzado a: %s\n",
+                              forzarOcupado ? "OCUPADO" : "LIBRE");
+            }
+            _kEstadoCambio = true; // Forzar redibujado siempre (puede haber cambiado nombre/mats)
+
+            // ── Construir respuesta compatible con Bridge (mismo formato que ReactionTime):
+            //    mix(1) + n_accesos(1) + [mat(8)] × n_accesos
+            uint8_t mix = 0;
+            if (_kEstado == EstadoEspacio::OCUPADO) mix |= 0x01; // bit0 = estado actual
+            if (lenNombre > 0)                      mix |= 0x02; // bit1 = nombre configurado
+
+            // Clasificar eventos: OK → matriculas a enviar; otros → flags en mix
+            uint8_t nOK = 0;
+            for (uint8_t i = 0; i < _kNEventos; i++) {
+                if      (_kEventos[i].tipo == KaizenEvento::ACCESO_OK)       nOK++;
+                else if (_kEventos[i].tipo == KaizenEvento::APERTURA_MANUAL) mix |= 0x04; // bit2
+                else if (_kEventos[i].tipo == KaizenEvento::ACCESO_DENEGADO) mix |= 0x08; // bit3
+            }
+
+            uint8_t buf[2 + KAIZEN_MAX_EVENTOS * 8];
+            uint16_t pos = 0;
+            buf[pos++] = mix;
+            buf[pos++] = nOK;
+            for (uint8_t i = 0; i < _kNEventos; i++) {
+                if (_kEventos[i].tipo != KaizenEvento::ACCESO_OK) continue;
+                memcpy(&buf[pos], _kEventos[i].matricula, 8); pos += 8;
+            }
+            if (_kResponder(K_OK, buf, (uint8_t)pos)) {
+                _kNEventos = 0; // Eventos confirmados
+            }
+            break;
+        }
+
         case K_ASK_VERSION: {
             const uint32_t v = KAIZEN_FIRMWARE_VERSION;
             uint8_t b[4] = {
@@ -371,6 +480,73 @@ static void _kProcesar() {
                 (uint8_t)(v >> 8),  (uint8_t)v
             };
             _kResponder(K_OK, b, 4);
+            break;
+        }
+
+        case K_UPDATE: {
+            // Protocolo OTA idéntico al de ReactionTime:
+            //   Primer paquete (8 bytes data): indice(4LE) + total(4LE)
+            //   Paquetes siguientes:           indice(4LE) + chunk(N bytes)
+            //   El Bridge espera OK con el offset confirmado en cada paso.
+            uint8_t lenDatos = _kLenMsgIn - 4;
+            uint32_t indiceRecibido = ((uint32_t)_kMsgIn.data[3] << 24)
+                                    | ((uint32_t)_kMsgIn.data[2] << 16)
+                                    | ((uint32_t)_kMsgIn.data[1] << 8)
+                                    |  (uint32_t)_kMsgIn.data[0];
+
+            if (!_kOtaStarted) {
+                // Primer paquete: handshake / inicio
+                if (lenDatos != 8) { _kHardReset(); break; }
+                if (indiceRecibido != _kOtaProgress) {
+                    // Bridge quiere reanudar desde otro offset — confirmar el nuestro
+                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                } else if (indiceRecibido == 0) {
+                    _kOtaTotal = ((uint32_t)_kMsgIn.data[7] << 24)
+                               | ((uint32_t)_kMsgIn.data[6] << 16)
+                               | ((uint32_t)_kMsgIn.data[5] << 8)
+                               |  (uint32_t)_kMsgIn.data[4];
+                    if (!Update.begin(_kOtaTotal)) {
+                        Update.printError(Serial);
+                        _kHardReset();
+                        break;
+                    }
+                    _kOtaStarted = true;
+                    Serial.printf("[OTA] Inicio. Total: %u bytes\n", _kOtaTotal);
+                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                } else {
+                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                }
+            } else {
+                // Paquetes de datos
+                int chunkLen = (int)lenDatos - 4;  // quitar los 4 bytes de índice
+                if (indiceRecibido == 0 && lenDatos == 8) {
+                    // Bridge reinicia desde 0 (reintento)
+                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                } else if (indiceRecibido != _kOtaProgress) {
+                    // Offset desfasado — indicar el nuestro
+                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                } else {
+                    if (Update.write(&_kMsgIn.data[4], chunkLen) != (size_t)chunkLen) {
+                        Update.printError(Serial);
+                        _kHardReset();
+                        break;
+                    }
+                    _kOtaProgress += chunkLen;
+                    if (_kOtaProgress >= _kOtaTotal) {
+                        Serial.println("[OTA] Completo. Reiniciando...");
+                        _kOtaStarted = false;
+                        if (Update.end()) {
+                            _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                            _kHardReset(); // reinicio inmediato con nuevo firmware
+                        } else {
+                            Update.printError(Serial);
+                            _kHardReset();
+                        }
+                    } else {
+                        _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                    }
+                }
+            }
             break;
         }
 
@@ -394,7 +570,7 @@ bool kaizen_begin() {
     _kEstadoCambio = true; // Forzar redibujado con el estado restaurado
 
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true, true);
+    WiFi.disconnect(false, true); // desconectar de AP (borra credenciales) pero mantiene el radio ON
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[ESPNOW] Error al inicializar ESP-NOW");
