@@ -18,6 +18,8 @@ build/
 # ── Sistema operativo ────────────────────────────────────────
 Thumbs.db
 .DS_Store
+._.DS_Store
+._*
 desktop.ini
 
 # ── Archivo original (Arduino IDE) ──────────────────────────
