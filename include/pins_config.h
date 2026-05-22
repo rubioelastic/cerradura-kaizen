@@ -93,7 +93,9 @@
 //  - NO se necesita convertidor 12V→5V externo
 // ─────────────────────────────────────────────────────────────
 #define RELE            1    // GPIO1 del header P3 → control del relé
-#define PULSADOR_PUERTA 2    // GPIO2 del header P3 → pulsador de apertura manual
+#define PULSADOR_PUERTA 2    // GPIO2 del header P3 → ELIMINADO DEL DISEÑO
+                              // (mantener por compatibilidad, no usar en código activo)
+                              // Ver DESARROLLO.md § 10
 
 // ─────────────────────────────────────────────────────────────
 // CANAL PWM para el buzzer (ESP32 LEDC)
