@@ -1,0 +1,29 @@
+# Configuración de cppcheck para Cerradura Kaizen
+# Referencia: https://cppcheck.sourceforge.io/manual.html
+
+# Archivos / carpetas a analizar
+src/
+include/
+
+# Directorios a ignorar (BSP, librerías externas)
+-i .pio/
+-i Doc_ini/
+-i test/mocks/
+
+# Estándar de C++
+--std=c++17
+
+# Reglas habilitadas
+--enable=warning,style,performance,portability
+
+# Supresiones
+--suppress=missingInclude          # headers del BSP no están en la ruta nativa
+--suppress=unmatchedSuppression    # supresiones inline que no aplican en todos los builds
+--suppress=noExplicitConstructor   # Structs simples sin constructor explícito (DateTime, AccessSchedule)
+--suppress=useInitializationList   # Constructores Arduino no usan listas de init
+--suppress=constParameter          # char* de EEPROM: herencia del código original
+
+# Comportamiento
+--inline-suppr                     # Permite // cppcheck-suppress inline en el código
+--quiet                            # Solo errores, sin progreso
+--error-exitcode=1                 # Falla el build si hay errores (para CI)
