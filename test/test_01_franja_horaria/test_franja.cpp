@@ -171,6 +171,10 @@ void test_acceso_en_limite_exacto_de_franja(void) {
     TEST_ASSERT_FALSE(isAccessAllowed(dt_antes,  schedule));
 }
 
+// ── setUp / tearDown (requeridos por Unity) ────────────────
+void setUp(void) {}
+void tearDown(void) {}
+
 // ── Entry point ─────────────────────────────────────────────
 int main(void) {
     UNITY_BEGIN();

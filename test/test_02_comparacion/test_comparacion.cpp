@@ -141,6 +141,10 @@ void test_matrículas_maestras_son_distintas_entre_si(void) {
     TEST_ASSERT_FALSE(Es0(m2));
 }
 
+// ── setUp / tearDown (requeridos por Unity) ────────────────
+void setUp(void) {}
+void tearDown(void) {}
+
 // ── Entry point ─────────────────────────────────────────────
 int main(void) {
     UNITY_BEGIN();
