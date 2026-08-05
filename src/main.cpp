@@ -64,12 +64,9 @@
 //   Usar M5Dial.Rfid es equivalente a usar mfrc522 en el código original,
 //   con la misma API: PICC_IsNewCardPresent(), PCD_Authenticate(), MIFARE_Read()…
 
-#include <M5Dial.h>           // BSP M5Dial: incluye soporte RFID, pantalla, RTC, etc.
-#include <EEPROM.h>           // Emulación EEPROM en flash del ESP32-S3
-
-extern "C" {
-#include "esp_wifi.h"         // esp_wifi_get_mac — para mostrar la MAC antes del Bridge
-}
+#include <M5Dial.h>           // BSP M5Dial
+#include <WiFi.h>             // WiFi.macAddress()
+#include <Preferences.h>      // estado de ocupación persistente
 
 #include "pins_config.h"      // Definición de pines GPIO del M5Dial
 #include "ui_display.h"       // Módulo de interfaz gráfica TFT
@@ -80,43 +77,19 @@ extern "C" {
 // CONSTANTES DE CONFIGURACIÓN
 // ─────────────────────────────────────────────────────────────
 
-// Máximo número de matrículas almacenables en EEPROM
-// MANTENIDO del código original: MAX_MATRICULAS 255
-#define MAX_MATRICULAS     255
-
 // Tiempo que la cerradura permanece abierta (ms)
-// MANTENIDO del código original: 3000ms
 #define TIEMPO_ABIERTA_MS  3000
 
-// Tiempo en modo gestión antes de confirmar acción (ms)
-// MANTENIDO del código original: 3000ms
-#define TIEMPO_MODO_MS     3000
-
-// Frecuencias del buzzer para diferentes eventos (Hz)
-// NUEVO: reemplaza los pulsos del relé (Pulsos_AddMode, etc.)
-#define FREQ_ACCESS_OK     1000  // Tono acceso concedido
-#define FREQ_ACCESS_DENY    400  // Tono acceso denegado
-#define FREQ_ADD_MODE      1200  // Tono modo añadir
-#define FREQ_REMOVE_MODE    600  // Tono modo eliminar
-#define FREQ_BEEP_SHORT     800  // Beep corto genérico
+// Frecuencias del buzzer
+#define FREQ_ACCESS_OK     1000
+#define FREQ_ACCESS_DENY    400
+#define FREQ_BEEP_SHORT     800
 
 // Timeout de operaciones RFID (ms)
-// NUEVO: previene bloqueos si el módulo RFID falla
-#define RFID_TIMEOUT_MS    1000  // 1 segundo máximo por lectura
+#define RFID_TIMEOUT_MS    1000
 
-// Base en EEPROM para flags de maestro (después de 255*8+1 bytes de matrículas)
-#define EEPROM_MAESTRO_FLAGS_BASE  2042
-
-// ─────────────────────────────────────────────────────────────
-// Matrículas maestras (MIGRADAS A EEPROM)
-// NUEVO: Se guardan en EEPROM a partir del byte 2042 (array de flags)
-// Byte 2042+i indica si la matrícula i es maestra (1=sí, 0=no)
-// ─────────────────────────────────────────────────────────────
-// Matrículas maestras por defecto (iniciales)
-const char* MAESTRAS_DEFECTO[] = {
-    "00405106",  // Maestra 1
-    "88040220"   // Maestra 2
-};
+// Tiempo mínimo entre dos lecturas de la misma matrícula (ms)
+#define DEDUP_MS           3000
 
 // ─────────────────────────────────────────────────────────────
 // INSTANCIAS DE LOS MÓDULOS
@@ -146,131 +119,60 @@ KaizenRTC rtc;
 
 // ─────────────────────────────────────────────────────────────
 // PROTOTIPOS DE FUNCIONES
-// (mismo convenio de nombres que el código original)
 // ─────────────────────────────────────────────────────────────
-bool     SonIguales(char *m1, char *m2);
-void     ReadEmpleado(char *empleado);
-bool     Habilitado(char *matricula);
-bool     Es0(char *matricula);
-void     AbrirCerradura();
-void     AddMatricula(char *matricula);
-void     RemoveMatricula(char *matricula);
-void     RemoveAllMatriculas();
-void     CopiarMatricula(char *origen, char *destino);
-void     GetMatricula(char *matricula, unsigned char i);
-int      Indice(char *matricula);
-unsigned char GetNMatriculasHabilitadas();
-void     habilitarMatricula(String m);
-void     MostrarMatriculasHabilitadas(); // Ahora muestra en pantalla, no Serial
-
-// NUEVO — Funciones de matrículas maestras (migradas a EEPROM)
-bool     EsMaestra(char *matricula);
-void     MarcarComaMaestra(char *matricula, bool esMaestra);
-void     InicializarMaestrasDefecto();
-
-// NUEVO — Funciones de buzzer (reemplazan Pulsos_AddMode, etc.)
-void     Buzzer_AccessOK();
-void     Buzzer_AccessDeny();
-void     Buzzer_AddMode();
-void     Buzzer_RemoveMode();
-void     Buzzer_RemoveAll();
-void     Buzzer_Beep(uint32_t freq, uint32_t durMs);
-
-// NUEVO — Funciones de UI y RTC
-void     ActualizarPantallaIdle();
-String   GetTimestampActual();
-
-// NUEVO — State machine para confirmación (sin while bloqueante)
-void     IniciarConfirmacion(const char *matricula, DateTime ahora);
-bool     ProcesarConfirmacion();
-void     FinalizarConfirmacion(const char *matricula, DateTime ahora);
+bool  SonIguales(char *m1, char *m2);
+void  ReadEmpleado(char *empleado);
+bool  Es0(char *matricula);
+void  AbrirCerradura();
+void  AbrirCerraduraRemota();
+void  AccesoOcupacion(const char *matricula, uint32_t epoch);
+void  GuardarEstadoSala();
+void  CopiarMatricula(char *origen, char *destino);
+void  Buzzer_AccessOK();
+void  Buzzer_AccessDeny();
+void  Buzzer_Beep(uint32_t freq, uint32_t durMs);
+void  ActualizarPantallaIdle();
 
 // ─────────────────────────────────────────────────────────────
 // VARIABLES GLOBALES
 // ─────────────────────────────────────────────────────────────
-unsigned long ultimaActualizacionHora = 0; // Control de refresco del reloj
-const unsigned long INTERVALO_HORA_MS = 1000; // Actualizar pantalla cada 1s
+unsigned long ultimaActualizacionHora = 0;
+const unsigned long INTERVALO_HORA_MS = 1000;
 
-// NUEVO — State machine para confirmación de liberación
-// (refactorización: de while bloqueante a state machine)
-bool confirmacionActiva = false;           // true mientras se espera confirmación
-unsigned long confirmStartTime = 0;        // Timestamp de inicio
-bool confirmLiberar = false;               // true si usuario toca, false si timeout
-char confirmMatricula[9] = {'0','0','0','0','0','0','0','0','\0'};  // Matrícula que está confirmando
-DateTime confirmDateTime;                   // Hora en que se inició la confirmación
+// Deduplicación: ignorar misma matrícula dentro de DEDUP_MS
+char     lastMatricula[9] = "00000000";
+uint32_t lastMatriculaMs  = 0;
 
-// Franja horaria de acceso (por defecto sin restricción)
-// NUEVO: se puede modificar en tiempo de ejecución via encoder
-AccessSchedule franjaAcceso = {
-    .startHour    = 7,
-    .startMinute  = 0,
-    .endHour      = 22,
-    .endMinute    = 0,
-    .enabledDays  = {false, true, true, true, true, true, false}, // Lun-Vie
-    .enabled      = false  // ← false = sin restricción horaria (igual que el original)
-};
+// Estado de ocupación (persistente en NVS)
+Preferences salaPrefs;
+bool        salaOcupada = false;
 
 // ============================================================
 //  S E T U P
 // ============================================================
 void setup() {
-    // ── Inicialización del BSP M5Dial
-    // M5Dial.begin() configura automáticamente:
-    //   · M5Dial.Display  → pantalla TFT GC9A01
-    //   · M5Dial.Rfid     → WS1850S via I2C interno (equivale a mfrc522.PCD_Init())
-    //   · M5Dial.Speaker  → buzzer integrado
-    //   · M5Dial.Encoder  → encoder rotatorio
-    //   · M5Dial.Rtc      → RTC BM8563
-    // No es necesario llamar a Wire.begin() ni SPI.begin() por separado.
     auto cfg = M5.config();
-    M5Dial.begin(cfg, true, false); // (config, encoder=true, IMU=false)
+    M5Dial.begin(cfg, true, false);
 
-    // ── Bus I2C
-    // M5Dial.begin() ya inicializa el bus I2C interno con los pines correctos.
-    // El RTC BM8563 comparte ese mismo bus. Wire queda listo para usarse.
-
-    // ── Configuración del relé
-    // CAMBIO respecto al original: GPIO5→GPIO1 (header P3 del M5Dial)
-    // No hay pulsador de puerta en esta versión.
     pinMode(RELE, OUTPUT);
-    digitalWrite(RELE, LOW); // Relé normalmente abierto (NO activo)
+    digitalWrite(RELE, LOW);
 
-    // ── Configuración del buzzer (LEDC PWM del ESP32-S3)
-    // NUEVO: reemplaza todos los Pulsos_* que usaban el relé como buzzer
     ledcSetup(BUZZER_CHANNEL, FREQ_BEEP_SHORT, BUZZER_RESOLUTION);
     ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
 
-    // ── Inicialización de la pantalla TFT y UI
-    // NUEVO: reemplaza toda la interfaz de Serial.print
-    ui.begin(); // Muestra splash screen durante 2 segundos
+    ui.begin();
 
-    // ── Inicialización de la EEPROM
-    // MANTENIDO del código original: mismo tamaño de partición
-    // COMPATIBLE: ESP32-S3 soporta la emulación de EEPROM en flash NVS
-    if (!EEPROM.begin(EEPROM_MAESTRO_FLAGS_BASE + MAX_MATRICULAS)) {
-        ui.drawError("Fallo EEPROM");
-        Buzzer_AccessDeny();
-        delay(3000);
-        // No se detiene el sistema; puede funcionar sin persistencia
-    }
-
-    // ── Inicialización del RTC BM8563
-    // NUEVO: no existía en el código original
     if (!rtc.begin()) {
         ui.drawError("Fallo RTC");
         Buzzer_AccessDeny();
         delay(3000);
-        // El sistema continúa sin RTC (sin timestamps ni control horario)
     } else {
-        // Forzar hora de compilación en este flash para poner en hora el RTC.
-        // Una vez el RTC tenga la hora correcta y la batería esté cargada,
-        // se puede eliminar esta línea para que la hora persista entre reinicios.
         rtc.setBuildTime();
     }
 
-    // ── Módulo RFID
-    // M5Dial.begin() ya inicializó M5Dial.Rfid (WS1850S integrado).
-    // Se puede verificar la versión del chip para confirmar comunicación:
+    Serial.begin(115200);
+    Serial.println("=== Cerradura Kaizen M5Dial ===");
+
     byte rfidVersion = M5Dial.Rfid.PCD_ReadRegister(MFRC522::VersionReg);
     if (rfidVersion == 0x00 || rfidVersion == 0xFF) {
         ui.drawError("Fallo RFID");
@@ -280,64 +182,23 @@ void setup() {
         Serial.printf("[RFID] WS1850S detectado, versión: 0x%02X\n", rfidVersion);
     }
 
-    // ── Inicialización de matrículas y maestras
-    // Garantizar siempre que las maestras por defecto existen y están marcadas,
-    // independientemente del estado previo de la EEPROM.
-    if (GetNMatriculasHabilitadas() == 0) {
-        Serial.println("[SETUP] EEPROM vacía, cargando maestras por defecto...");
-        InicializarMaestrasDefecto();
-    } else {
-        // EEPROM ya tiene datos: asegurar que cada maestra por defecto
-        // está añadida y marcada como maestra.
-        for (int i = 0; i < 2; i++) {
-            AddMatricula((char*)MAESTRAS_DEFECTO[i]);         // no-op si ya existe
-            MarcarComaMaestra((char*)MAESTRAS_DEFECTO[i], true);
-        }
-        Serial.println("[SETUP] Maestras por defecto verificadas en EEPROM");
-    }
-
-    // ── Mostrar matrículas habilitadas por consola serie (solo depuración)
-    // CAMBIO: Serial se usa SOLO para depuración, no como interfaz de usuario
-    Serial.begin(115200);
-    Serial.println("=== Cerradura Kaizen M5Dial ===");
-    MostrarMatriculasHabilitadas();
-
-    // ── Comunicación ESP-NOW con el Bridge
-    // Registrar callback para cuando el Bridge envíe lista de matrículas (KAIZEN_CONFIG)
-    kaizen_setConfigCallback([](const uint8_t *mats, uint8_t n, const char *nombre) {
-        // Sincronizar EEPROM con la lista de matrículas del Bridge
-        EEPROM.write(0, 0);
-        EEPROM.commit();
-        for (uint8_t i = 0; i < n && i < MAX_MATRICULAS; i++) {
-            char m[9];
-            memcpy(m, mats + i * 8, 8);
-            m[8] = '\0';
-            habilitarMatricula(String(m));
-        }
-        Serial.printf("[BRIDGE] Matrículas sincronizadas: %u\n", n);
-        (void)nombre; // nombre ya guardado en _kNombre por el módulo
-    });
     if (!kaizen_begin()) {
         ui.drawError("Fallo ESP-NOW");
         delay(2000);
-        // El sistema continúa en modo local (EEPROM) sin conectividad
     }
 
-    // Imprimir MAC en pantalla y serie para facilitar el registro en el Bridge
+    salaPrefs.begin("sala", true);
+    salaOcupada = salaPrefs.getBool("ocup", false);
+    salaPrefs.end();
+    Serial.printf("[SALA] Estado recuperado: %s\n", salaOcupada ? "OCUPADA" : "LIBRE");
+
     {
-        uint8_t mac[6];
-        if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
-            Serial.printf("[ESPNOW] MAC STA: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            char macStr[18];
-            snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            // Mostrar MAC en pantalla mientras no hay Bridge
-            ui.drawIdle("--:--", macStr);
-        }
+        String macAddr = WiFi.macAddress();
+        Serial.printf("[MAC] %s\n", macAddr.c_str());
+        ui.drawIdle("--:--", macAddr.c_str());
+        delay(4000);  // mostrar MAC 4 segundos
     }
 
-    // ── Pantalla de espera inicial
     ActualizarPantallaIdle();
 }
 
@@ -345,261 +206,83 @@ void setup() {
 //  L O O P
 // ============================================================
 void loop() {
-    // ── Actualizar M5Dial (encoder, touch, IMU)
     M5Dial.update();
-
-    // ── Procesar mensajes ESP-NOW del Bridge
     kaizen_tick();
 
-    // ── Si el estado del espacio cambió (Bridge liberó/ocupó, o timeout)
     if (kaizen_hayEstadoCambio()) {
         ActualizarPantallaIdle();
     }
 
-    // ── NUEVO: Procesar confirmación de liberación (state machine)
-    // Esto reemplaza el while bloqueante anterior
-    if (confirmacionActiva) {
-        if (ProcesarConfirmacion()) {
-            // Confirmación completada (usuario tocó o timeout)
-            FinalizarConfirmacion(confirmMatricula, confirmDateTime);
-            ActualizarPantallaIdle();
-        }
+    // ── Apertura remota solicitada por el Bridge
+    if (kaizen_hayAperturaRemota()) {
+        AbrirCerraduraRemota();
+        return;
     }
 
-    // ── Actualizar reloj cada segundo en pantallas que lo muestran
     if (millis() - ultimaActualizacionHora > INTERVALO_HORA_MS) {
         ultimaActualizacionHora = millis();
-        UIState s = ui.getState();
-        if (s == UI_STATE_IDLE || s == UI_STATE_LIBRE) {
+        if (ui.getState() == UI_STATE_IDLE) {
             ActualizarPantallaIdle();
         }
     }
 
     // ── Leer tarjeta RFID
-    // CAMBIO: ReadEmpleado() ahora usa WS1850S I2C en vez de MFRC522 SPI
     char matricula[9] = {'0','0','0','0','0','0','0','0','\0'};
     ReadEmpleado(matricula);
 
-    // Sin tarjeta detectada → volver al inicio del loop
-    if (Es0(matricula)) {
+    if (Es0(matricula)) return;
+
+    // ── Deduplicación: ignorar misma matrícula dentro de DEDUP_MS
+    if (SonIguales(lastMatricula, matricula) &&
+        (millis() - lastMatriculaMs) < DEDUP_MS) {
+        return;
+    }
+    CopiarMatricula(matricula, lastMatricula);
+    lastMatricula[8] = '\0';
+    lastMatriculaMs  = millis();
+
+    ui.drawReadingCard(matricula);
+    delay(100);
+
+    // ── Obtener timestamp
+    DateTime ahora = rtc.getDateTime();
+    uint32_t epoch = rtc.toEpoch(ahora);
+    char ts[8];
+    rtc.formatTime(ahora, ts, sizeof(ts));
+
+    // ── Verificar autorización
+    bool autorizado = kaizen_accesoLibre() || kaizen_estaAutorizado(matricula);
+
+    // ── MODO APERTURA (clásico)
+    if (!kaizen_modoOcupacion()) {
+        kaizen_registrarFichaje(matricula, autorizado, epoch, KAIZEN_EVENTO_ACCESO);
+        if (autorizado) {
+            ui.drawAccessOK(matricula, ts);
+            Buzzer_AccessOK();
+            AbrirCerradura();
+        } else {
+            ui.drawAccessDeny(matricula, ts);
+            Buzzer_AccessDeny();
+            delay(2000);
+            ActualizarPantallaIdle();
+        }
         return;
     }
 
-    // ── TARJETA DETECTADA — Mostrar matrícula leída en pantalla
-    // NUEVO: reemplaza Serial.printf("Matricula leida: %s\n", matricula)
-    ui.drawReadingCard(matricula);
-    delay(100); // Pequeña pausa visual
-
-    // ─────────────────────────────────────────────────────────
-    // VERIFICAR ACCESO
-    // Lógica MANTENIDA del código original (mismo orden de prioridad)
-    // ─────────────────────────────────────────────────────────
-
-    if (EsMaestra(matricula)) {
-        // ── Tarjeta maestra → abre siempre; en modo estado libera si está ocupado
-        DateTime ahora = rtc.getDateTime();
-        if (rtc.isAccessAllowed(ahora, franjaAcceso)) {
-            char ts[20];
-            rtc.formatTime(ahora, ts, sizeof(ts));
-            ui.drawAccessOK("MASTER", ts);
-            Buzzer_AccessOK();
-            if (kaizen_isBridgeOK() && kaizen_isModoEstado() &&
-                kaizen_getEstado() == EstadoEspacio::OCUPADO) {
-                kaizen_marcarLibre();
-            }
-            kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
-            AbrirCerradura();
-        } else {
-            char ts[20];
-            rtc.formatTime(ahora, ts, sizeof(ts));
-            ui.drawAccessDeny("MASTER (HORARIO)", ts);
-            Buzzer_AccessDeny();
-            kaizen_registrarEvento(KaizenEvento::ACCESO_DENEGADO, matricula, millis());
-            delay(2000);
-        }
-
-    } else if (Habilitado(matricula)) {
-        DateTime ahora = rtc.getDateTime();
-        if (rtc.isAccessAllowed(ahora, franjaAcceso)) {
-            char ts[20];
-            rtc.formatTime(ahora, ts, sizeof(ts));
-
-            bool modoEstado = kaizen_isBridgeOK() && kaizen_isModoEstado();
-
-            if (modoEstado && kaizen_getEstado() == EstadoEspacio::OCUPADO) {
-                // ── Modo estado + espacio OCUPADO
-                if (strncmp(matricula, kaizen_getOcupante(), 8) == 0) {
-                    // Misma persona que ocupó: preguntar si quiere liberar o entrar de nuevo
-                    // NUEVO: Usar state machine en lugar de while bloqueante
-                    // La confirmación se procesará en el loop principal
-                    IniciarConfirmacion(matricula, ahora);
-                    // El loop principal llamará a ProcesarConfirmacion() cada iteración
-                    // Cuando se complete, se ejecutará FinalizarConfirmacion()
-                    return;  // Salir del loop actual para que el loop principal continúe
-                } else {
-                    // Persona diferente → solo abre, estado sigue OCUPADO
-                    ui.drawAccessOK(matricula, ts);
-                    Buzzer_AccessOK();
-                    kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
-                    AbrirCerradura();
-                }
-            } else {
-                // ── Solo acceso, o modo estado con espacio LIBRE → acceso normal
-                ui.drawAccessOK(matricula, ts);
-                Buzzer_AccessOK();
-                if (modoEstado) {
-                    // Espacio estaba LIBRE → pasa a OCUPADO con esta persona
-                    kaizen_marcarOcupado(matricula);
-                }
-                kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
-                AbrirCerradura();
-            }
-        } else {
-            char ts[20];
-            rtc.formatTime(ahora, ts, sizeof(ts));
-            ui.drawAccessDeny(matricula, ts);
-            Buzzer_AccessDeny();
-            kaizen_registrarEvento(KaizenEvento::ACCESO_DENEGADO, matricula, millis());
-            delay(2000);
-        }
-
-    } else {
-        // ── Tarjeta desconocida → acceso denegado
-        DateTime ahora = rtc.getDateTime();
-        char ts[20];
-        rtc.formatTime(ahora, ts, sizeof(ts));
+    // ── MODO OCUPACIÓN
+    if (!autorizado) {
+        kaizen_registrarFichaje(matricula, false, epoch, KAIZEN_EVENTO_ACCESO);
         ui.drawAccessDeny(matricula, ts);
         Buzzer_AccessDeny();
-        kaizen_registrarEvento(KaizenEvento::ACCESO_DENEGADO, matricula, millis());
         delay(2000);
         ActualizarPantallaIdle();
         return;
     }
-
-    // ─────────────────────────────────────────────────────────
-    // MODO GESTIÓN DE MATRÍCULAS (solo con tarjeta maestra)
-    // Lógica MANTENIDA del código original
-    //
-    // Secuencia de detección (idéntica al original):
-    //   1. Tarjeta maestra presentada → decide abrir O gestionar
-    //   2. Si se mantiene en el campo > TIEMPO_MODO_MS → Modo AÑADIR
-    //   3. Si se mantiene de nuevo    > TIEMPO_MODO_MS → Modo ELIMINAR
-    //   4. Si se mantiene de nuevo    > TIEMPO_MODO_MS → BORRAR TODO
-    //
-    // CAMBIO: Los Pulsos_AddMode() reemplazados por Buzzer_AddMode()
-    //         y ui.drawAddMode() en la pantalla
-    // ─────────────────────────────────────────────────────────
-
-    // Sólo entra en gestión si la tarjeta era una maestra
-    ReadEmpleado(matricula);
-    if (!EsMaestra(matricula)) {
-        // Si ya no detecta una maestra, salir
-        ActualizarPantallaIdle();
-        return;
-    }
-
-    // Una maestra se ha vuelto a detectar → señal de modo gestión
-    // CAMBIO: Pulsos_AddMode() → Buzzer_AddMode() + ui.drawAddMode()
-    Buzzer_AddMode();
-    ui.drawAddMode(3);
-
-    // Espera a que la maestra retire la tarjeta (o se agote el tiempo)
-    unsigned long tiempo = millis() + TIEMPO_MODO_MS;
-    ReadEmpleado(matricula);
-    while (EsMaestra(matricula) && tiempo > millis()) {
-        ReadEmpleado(matricula);
-        // Actualizar cuenta atrás en pantalla
-        int countdown = (int)((tiempo - millis()) / 1000) + 1;
-        ui.drawAddMode(countdown);
-    }
-
-    if (tiempo < millis()) {
-        // ─────────────────────────────────────────────────────
-        // MODO ELIMINAR (se pasa al siguiente nivel)
-        // ─────────────────────────────────────────────────────
-        // CAMBIO: Pulsos_RemoveMode() → Buzzer_RemoveMode() + ui.drawRemoveMode()
-        Buzzer_RemoveMode();
-        ui.drawRemoveMode(3);
-
-        tiempo = millis() + TIEMPO_MODO_MS;
-        ReadEmpleado(matricula);
-        while (EsMaestra(matricula) && tiempo > millis()) {
-            ReadEmpleado(matricula);
-            int countdown = (int)((tiempo - millis()) / 1000) + 1;
-            ui.drawRemoveMode(countdown);
-        }
-
-        if (tiempo < millis()) {
-            // ─────────────────────────────────────────────────
-            // BORRAR TODAS LAS MATRÍCULAS
-            // ─────────────────────────────────────────────────
-            // CAMBIO: Pulsos_RemoveAllMode() → Buzzer_RemoveAll() + ui.drawRemoveAll()
-            Buzzer_RemoveAll();
-            ui.drawRemoveAll();
-            RemoveAllMatriculas();
-            delay(2000);
-
-        } else {
-            // ─────────────────────────────────────────────────
-            // MODO ELIMINAR INDIVIDUALMENTE
-            // ─────────────────────────────────────────────────
-            // NUEVO: mensaje en pantalla (el original usaba Serial.println)
-            ui.drawRemoveMode(3);
-            tiempo = millis() + TIEMPO_MODO_MS;
-            char ult[9] = {'0','0','0','0','0','0','0','0','\0'};
-
-            while (tiempo > millis()) {
-                // Actualizar cuenta atrás
-                int countdown = (int)((tiempo - millis()) / 1000) + 1;
-                ui.drawRemoveMode(countdown);
-
-                ReadEmpleado(matricula);
-                if (!Es0(matricula) && !SonIguales(ult, matricula)) {
-                    RemoveMatricula(matricula);
-                    tiempo = millis() + TIEMPO_MODO_MS; // Reinicia temporizador
-                    CopiarMatricula(matricula, ult);
-                }
-                // NOTA: El pulsador de puerta (GPIO2) se eliminó del diseño físico.
-                // Esta línea está comentada para evitar código muerto.
-                // Ver DESARROLLO.md § 10 "¿Por qué no hay pulsador de puerta?"
-                // if (digitalRead(PULSADOR_PUERTA) == LOW) AbrirCerradura();
-            }
-            // CAMBIO: Pulso() → Buzzer_Beep() breve
-            Buzzer_Beep(FREQ_BEEP_SHORT, 100);
-        }
-
-    } else {
-        // ─────────────────────────────────────────────────────
-        // MODO AÑADIR INDIVIDUALMENTE
-        // ─────────────────────────────────────────────────────
-        // NUEVO: mensaje en pantalla (el original usaba Serial.println)
-        ui.drawAddMode(3);
-        tiempo = millis() + TIEMPO_MODO_MS;
-        char ult[9] = {'0','0','0','0','0','0','0','0','\0'};
-
-        while (tiempo > millis()) {
-            // Actualizar cuenta atrás
-            int countdown = (int)((tiempo - millis()) / 1000) + 1;
-            ui.drawAddMode(countdown);
-
-            ReadEmpleado(matricula);
-            if (!Es0(matricula) && !SonIguales(ult, matricula)) {
-                AddMatricula(matricula);
-                tiempo = millis() + TIEMPO_MODO_MS; // Reinicia temporizador
-                CopiarMatricula(matricula, ult);
-            }
-            // NOTA: El pulsador de puerta (GPIO2) se eliminó del diseño físico.
-            // Esta línea está comentada para evitar código muerto.
-            // Ver DESARROLLO.md § 10 "¿Por qué no hay pulsador de puerta?"
-            // if (digitalRead(PULSADOR_PUERTA) == LOW) AbrirCerradura();
-        }
-        // CAMBIO: Pulso() → Buzzer_Beep() breve
-        Buzzer_Beep(FREQ_BEEP_SHORT, 100);
-    }
-
-    // Volver a la pantalla de espera tras cualquier modo de gestión
-    ActualizarPantallaIdle();
+    // Tarjeta autorizada: siempre abre; mantener 5 s alterna ocupar/liberar
+    AccesoOcupacion(matricula, epoch);
 }
+
+
 
 // ============================================================
 //  F U N C I O N E S   D E   A C C E S O
@@ -611,18 +294,75 @@ void loop() {
 // CAMBIO: el GPIO del relé es ahora GPIO1 (header P3) en vez de GPIO5
 // ─────────────────────────────────────────────────────────────
 void AbrirCerradura() {
-    // NUEVO: desactivar buzzer si estaba sonando
     ledcWriteTone(BUZZER_CHANNEL, 0);
-
     Serial.println("[ACCESO] Cerradura abierta");
-
-    // MANTENIDO del código original: activa relé 3 segundos
     digitalWrite(RELE, HIGH);
     delay(TIEMPO_ABIERTA_MS);
     digitalWrite(RELE, LOW);
-
-    // Volver a la pantalla de espera tras abrir
     ActualizarPantallaIdle();
+}
+
+void AbrirCerraduraRemota() {
+    ledcWriteTone(BUZZER_CHANNEL, 0);
+    Serial.println("[REMOTO] Apertura remota — 10 segundos");
+    DateTime ahora = rtc.getDateTime();
+    char ts[8];
+    rtc.formatTime(ahora, ts, sizeof(ts));
+    ui.drawAccessOK("REMOTO", ts);
+    Buzzer_AccessOK();
+    digitalWrite(RELE, HIGH);
+    delay(10000);
+    digitalWrite(RELE, LOW);
+    ActualizarPantallaIdle();
+}
+
+void AccesoOcupacion(const char *matricula, uint32_t epoch) {
+    // 1) Registrar el acceso y abrir la puerta
+    kaizen_registrarFichaje(matricula, true, epoch, KAIZEN_EVENTO_ACCESO);
+    ledcWriteTone(BUZZER_CHANNEL, 0);
+    Buzzer_AccessOK();
+    digitalWrite(RELE, HIGH);
+    Serial.println("[OCUPACION] Puerta abierta");
+
+    // 2) Detectar si mantiene la tarjeta 5 s para alternar estado.
+    //    El relé se cierra a los TIEMPO_ABIERTA_MS aunque siga manteniendo.
+    const uint32_t HOLD_MS = 5000;
+    uint32_t inicio = millis();
+    bool releCerrado = false, mantenida = true, primera = true;
+    const char *accion = salaOcupada ? "LIBERAR" : "OCUPAR";
+    char m[9];
+    while (millis() - inicio < HOLD_MS) {
+        if (!releCerrado && (millis() - inicio) >= TIEMPO_ABIERTA_MS) {
+            digitalWrite(RELE, LOW);
+            releCerrado = true;
+        }
+        int restante = (int)((HOLD_MS - (millis() - inicio)) / 1000) + 1;
+        ui.drawMantener(accion, restante, primera);
+        primera = false;
+        ReadEmpleado(m);
+        if (Es0(m) || !SonIguales((char*)matricula, m)) {
+            mantenida = false;
+            break;
+        }
+    }
+    if (!releCerrado) digitalWrite(RELE, LOW);
+
+    // 3) Se mantuvo los 5 s → alternar estado de la sala
+    if (mantenida) {
+        salaOcupada = !salaOcupada;
+        GuardarEstadoSala();
+        uint8_t tipo = salaOcupada ? KAIZEN_EVENTO_OCUPAR : KAIZEN_EVENTO_LIBERAR;
+        kaizen_registrarFichaje(matricula, true, epoch, tipo);
+        Serial.printf("[OCUPACION] Sala %s\n", salaOcupada ? "OCUPADA" : "LIBERADA");
+        Buzzer_AccessOK();
+    }
+    ActualizarPantallaIdle();
+}
+
+void GuardarEstadoSala() {
+    salaPrefs.begin("sala", false);
+    salaPrefs.putBool("ocup", salaOcupada);
+    salaPrefs.end();
 }
 
 // ============================================================
@@ -657,42 +397,6 @@ void Buzzer_AccessOK() {
 // ─────────────────────────────────────────────────────────────
 void Buzzer_AccessDeny() {
     Buzzer_Beep(FREQ_ACCESS_DENY, 400);
-}
-
-// ─────────────────────────────────────────────────────────────
-// Buzzer_AddMode — equivale a Pulsos_AddMode() del original
-// El original hacía 2 pulsos con el relé.
-// NUEVO: 2 beeps rápidos ascendentes con el buzzer integrado
-// ─────────────────────────────────────────────────────────────
-void Buzzer_AddMode() {
-    // Antes (original): 2 pulsos de relé de 100ms
-    Buzzer_Beep(FREQ_ADD_MODE, 100); delay(100);
-    Buzzer_Beep(FREQ_ADD_MODE, 100);
-}
-
-// ─────────────────────────────────────────────────────────────
-// Buzzer_RemoveMode — equivale a Pulsos_RemoveMode() del original
-// El original hacía 3 pulsos con el relé.
-// NUEVO: 3 beeps rápidos con el buzzer integrado
-// ─────────────────────────────────────────────────────────────
-void Buzzer_RemoveMode() {
-    // Antes (original): 3 pulsos de relé de 100ms
-    Buzzer_Beep(FREQ_REMOVE_MODE, 100); delay(100);
-    Buzzer_Beep(FREQ_REMOVE_MODE, 100); delay(100);
-    Buzzer_Beep(FREQ_REMOVE_MODE, 100);
-}
-
-// ─────────────────────────────────────────────────────────────
-// Buzzer_RemoveAll — equivale a Pulsos_RemoveAllMode() del original
-// El original hacía 8 pulsos con el relé.
-// NUEVO: 5 beeps descendentes (señal de advertencia)
-// ─────────────────────────────────────────────────────────────
-void Buzzer_RemoveAll() {
-    // Antes (original): 8 pulsos de relé de 100ms con el relé
-    for (int i = 5; i > 0; i--) {
-        Buzzer_Beep(200 * i, 120);
-        delay(80);
-    }
 }
 
 // ============================================================
@@ -831,212 +535,6 @@ void ReadEmpleado(char *empleado) {
     Serial.printf("[RFID] Matrícula leída: %s (tiempo: %lums)\n", empleado, elapsed);
 }
 
-// ============================================================
-//  F U N C I O N E S   D E   E E P R O M
-//  (mantenidas del código original, sin cambios funcionales)
-// ============================================================
-
-// ─────────────────────────────────────────────────────────────
-// GetNMatriculasHabilitadas — lee el contador del byte 0
-// MANTENIDA del código original: sin cambios
-// ─────────────────────────────────────────────────────────────
-unsigned char GetNMatriculasHabilitadas() {
-    return (unsigned char)EEPROM.read(0);
-}
-
-// ─────────────────────────────────────────────────────────────
-// GetMatricula — lee la matrícula en posición i de la EEPROM
-// MANTENIDA del código original: sin cambios
-// ─────────────────────────────────────────────────────────────
-void GetMatricula(char *matricula, unsigned char i) {
-    int j = 0;
-    while (j < 8) {
-        matricula[j] = (char)EEPROM.read((i * 8) + j + 1);
-        j++;
-    }
-    matricula[j] = '\0';
-}
-
-// ─────────────────────────────────────────────────────────────
-// habilitarMatricula — añade una matrícula (acepta String)
-// OPTIMIZACIÓN: Agrupar todas las escrituras en un único commit
-// ─────────────────────────────────────────────────────────────
-void habilitarMatricula(String m) {
-    int i = 0;
-    unsigned char nMatriculas = GetNMatriculasHabilitadas();
-    // Escribir 8 bytes de la matrícula sin commit en cada uno
-    while (i < 8) {
-        EEPROM.write((nMatriculas * 8) + i + 1, m[i]);
-        i++;
-    }
-    nMatriculas++;
-    EEPROM.write(0, nMatriculas);
-    // Un único commit al final (reducción de 9 commits → 1 commit)
-    EEPROM.commit();
-}
-
-// ─────────────────────────────────────────────────────────────
-// AddMatricula — añade si no está ya habilitada
-// OPTIMIZACIÓN: Agrupar todas las escrituras en un único commit
-// ─────────────────────────────────────────────────────────────
-void AddMatricula(char *matricula) {
-    if (!Habilitado(matricula)) {
-        unsigned char nMatriculas = GetNMatriculasHabilitadas();
-        // Escribir 8 bytes de la matrícula sin commit en cada uno
-        for (int i = 0; i < 8; i++) {
-            EEPROM.write((nMatriculas * 8) + i + 1, matricula[i]);
-        }
-        nMatriculas++;
-        EEPROM.write(0, nMatriculas);
-        // Un único commit al final (reducción de 9 commits → 1 commit)
-        EEPROM.commit();
-    }
-    // Feedback sonoro
-    Buzzer_Beep(FREQ_BEEP_SHORT, 80);
-    Serial.printf("[EEPROM] Matrícula añadida: %s\n", matricula);
-}
-
-// ─────────────────────────────────────────────────────────────
-// RemoveMatricula — elimina todas las ocurrencias de la matrícula
-// OPTIMIZACIÓN: Agrupar todas las escrituras en commits por iteración
-// (en lugar de un commit por cada byte)
-// ─────────────────────────────────────────────────────────────
-void RemoveMatricula(char *matricula) {
-    int i = Indice(matricula);
-    while (i != -1) {
-        unsigned char nMatriculas = GetNMatriculasHabilitadas();
-        // Compactar: desplaza todos los registros posteriores hacia atrás
-        while (i < nMatriculas) {
-            // Escribir 8 bytes sin commit en cada uno
-            for (int z = 0; z < 8; z++) {
-                EEPROM.write((i * 8) + z + 1, EEPROM.read(((i + 1) * 8) + z + 1));
-            }
-            // Un commit por cada matrícula compactada (en lugar de 8 commits)
-            EEPROM.commit();
-            i++;
-        }
-        nMatriculas--;
-        EEPROM.write(0, nMatriculas);
-        EEPROM.commit();
-        i = Indice(matricula); // Buscar de nuevo por si había duplicados
-    }
-    // Feedback sonoro
-    Buzzer_Beep(FREQ_BEEP_SHORT, 80);
-    Serial.printf("[EEPROM] Matrícula eliminada: %s\n", matricula);
-}
-
-// ─────────────────────────────────────────────────────────────
-// RemoveAllMatriculas — pone el contador a 0
-// CAMBIO: Pulsos_RemoveAllMode() eliminado (ya se llama antes)
-//         EEPROM.write(0,0) → ahora limpia todo el espacio usado
-// ─────────────────────────────────────────────────────────────
-void RemoveAllMatriculas() {
-    // MANTENIDA del original: poner contador a 0
-    EEPROM.write(0, 0);
-    EEPROM.commit();
-    Serial.println("[EEPROM] Todas las matrículas eliminadas");
-}
-
-// ============================================================
-//  F U N C I O N E S   D E   M A E S T R A S
-//  (NUEVO: migradas de variables hardcodeadas a EEPROM)
-// ============================================================
-
-// ─────────────────────────────────────────────────────────────
-// EsMaestra — verifica si una matrícula está marcada como maestra
-// NUEVO: función que reemplaza comparaciones hardcodeadas
-// ─────────────────────────────────────────────────────────────
-bool EsMaestra(char *matricula) {
-    int idx = Indice(matricula);
-    if (idx == -1) return false;  // Matrícula no existe
-
-    // Leer flag de maestro del EEPROM
-    return EEPROM.read(EEPROM_MAESTRO_FLAGS_BASE + idx) == 1;
-}
-
-// ─────────────────────────────────────────────────────────────
-// MarcarComaMaestra — marca una matrícula como maestra
-// NUEVO: función para cambiar maestras sin recompilar
-// ─────────────────────────────────────────────────────────────
-void MarcarComaMaestra(char *matricula, bool esMaestra) {
-    int idx = Indice(matricula);
-    if (idx == -1) {
-        Serial.printf("[MAESTRO] Error: matrícula %s no existe\n", matricula);
-        return;
-    }
-
-    if (esMaestra) {
-        EEPROM.write(EEPROM_MAESTRO_FLAGS_BASE + idx, 1);
-    } else {
-        EEPROM.write(EEPROM_MAESTRO_FLAGS_BASE + idx, 0);
-    }
-    EEPROM.commit();
-
-    Serial.printf("[MAESTRO] Matrícula %s %s maestra\n",
-                  matricula, esMaestra ? "marcada como" : "desmarcada de");
-}
-
-// ─────────────────────────────────────────────────────────────
-// InicializarMaestrasDefecto — carga las maestras por defecto
-// NUEVO: llamado en setup() si la EEPROM está vacía
-// ─────────────────────────────────────────────────────────────
-void InicializarMaestrasDefecto() {
-    // Primero, guardar las matrículas maestras con AddMatricula()
-    for (int i = 0; i < 2; i++) {
-        AddMatricula((char*)MAESTRAS_DEFECTO[i]);
-        // MarcarComaMaestra ya se hace en línea siguiente
-    }
-
-    // Luego, marcarlas como maestras
-    for (int i = 0; i < 2; i++) {
-        MarcarComaMaestra((char*)MAESTRAS_DEFECTO[i], true);
-    }
-
-    Serial.println("[MAESTRO] Maestras por defecto inicializadas en EEPROM");
-}
-
-// ─────────────────────────────────────────────────────────────
-// MostrarMatriculasHabilitadas — lista las matrículas guardadas
-// CAMBIO: Serial.print → ahora además hace log por Serie (depuración)
-// En la pantalla TFT se mostraría con otra función de menú (futuro)
-// ─────────────────────────────────────────────────────────────
-void MostrarMatriculasHabilitadas() {
-    unsigned char nMatriculas = GetNMatriculasHabilitadas();
-    Serial.printf("[EEPROM] Matrículas habilitadas: %u\n", nMatriculas);
-    for (int i = 0; i < nMatriculas; i++) {
-        char m[9];
-        GetMatricula(m, i);
-        Serial.printf("  [%02d] %s\n", i, m);
-    }
-}
-
-// ============================================================
-//  F U N C I O N E S   A U X I L I A R E S
-//  (mantenidas del código original)
-// ============================================================
-
-// ─────────────────────────────────────────────────────────────
-// Indice — devuelve la posición de una matrícula en la EEPROM
-// MANTENIDA del código original: sin cambios
-// ─────────────────────────────────────────────────────────────
-int Indice(char *matricula) {
-    unsigned char nMatriculas = GetNMatriculasHabilitadas();
-    for (int i = 0; i < nMatriculas; i++) {
-        char m[9];
-        GetMatricula(m, i);
-        if (SonIguales(matricula, m)) return i;
-    }
-    return -1;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Habilitado — comprueba si la matrícula está en la EEPROM
-// MANTENIDA del código original: sin cambios
-// ─────────────────────────────────────────────────────────────
-bool Habilitado(char *matricula) {
-    return Indice(matricula) != -1;
-}
-
 // ─────────────────────────────────────────────────────────────
 // SonIguales — compara dos matrículas de 8 caracteres
 // MANTENIDA del código original: sin cambios
@@ -1067,147 +565,24 @@ void CopiarMatricula(char *origen, char *destino) {
 
 // ============================================================
 //  F U N C I O N E S   D E   U I   y   R T C
-//  (nuevas, no existían en el código original)
 // ============================================================
 
-// ─────────────────────────────────────────────────────────────
-// ActualizarPantallaIdle — refresca la pantalla de espera
-// con la hora y fecha actuales del RTC BM8563
-//
-// NUEVO: reemplaza todos los Serial.print de estado del loop
-// ─────────────────────────────────────────────────────────────
 void ActualizarPantallaIdle() {
+    if (kaizen_modoOcupacion() && salaOcupada) {
+        ui.drawOcupado(kaizen_getNombre());
+        ui.drawBridgeIndicator(kaizen_isBridgeOK());
+        return;
+    }
     DateTime ahora = rtc.getDateTime();
-
-    char timeStr[8];  // "HH:MM"
-    char dateStr[20]; // "DD / MM / AAAA"
+    char timeStr[8];
+    char dateStr[20];
     rtc.formatTime(ahora, timeStr, sizeof(timeStr));
     rtc.formatDate(ahora, dateStr, sizeof(dateStr));
 
-    // Si el Bridge está conectado Y el espacio tiene modo estado, mostrar LIBRE/OCUPADO
-    if (kaizen_isBridgeOK() && kaizen_isModoEstado()) {
-        if (kaizen_getEstado() == EstadoEspacio::OCUPADO) {
-            if (ui.getState() != UI_STATE_OCUPADO) {
-                ui.drawOcupado(kaizen_getNombre());
-            }
-            // OCUPADO no tiene reloj → no hacer update parcial
-        } else {
-            // LIBRE con reloj
-            if (ui.getState() == UI_STATE_LIBRE) {
-                ui.updateLibreTime(timeStr, dateStr);
-            } else {
-                ui.drawLibre(timeStr, dateStr, kaizen_getNombre());
-            }
-        }
+    if (ui.getState() == UI_STATE_IDLE) {
+        ui.updateIdleTime(timeStr, dateStr);
     } else {
-        // Sin Bridge: comportamiento original (reloj + candado)
-        if (ui.getState() == UI_STATE_IDLE) {
-            ui.updateIdleTime(timeStr, dateStr);
-        } else {
-            ui.drawIdle(timeStr, dateStr);
-        }
+        ui.drawIdle(timeStr, dateStr);
     }
-
-    // Indicador LED de conexión Bridge (esquina superior derecha)
-    // Visible en todas las pantallas de espera: IDLE, LIBRE y OCUPADO
     ui.drawBridgeIndicator(kaizen_isBridgeOK());
-}
-
-// ─────────────────────────────────────────────────────────────
-// GetTimestampActual — devuelve una cadena con la fecha/hora actual
-// Útil para registrar eventos de acceso
-//
-// NUEVO: no existía en el código original
-// ─────────────────────────────────────────────────────────────
-String GetTimestampActual() {
-    DateTime ahora = rtc.getDateTime();
-    char buf[22];
-    rtc.formatTimestamp(ahora, buf, sizeof(buf));
-    return String(buf);
-}
-
-// ============================================================
-//  F U N C I O N E S   D E   C O N F I R M A C I Ó N
-//  (NUEVO: state machine para evitar while bloqueante)
-// ============================================================
-
-// ─────────────────────────────────────────────────────────────
-// IniciarConfirmacion — inicia la pantalla de confirmación
-// (sin bloquear el loop principal)
-// ─────────────────────────────────────────────────────────────
-void IniciarConfirmacion(const char *matricula, DateTime ahora) {
-    confirmacionActiva = true;
-    confirmStartTime = millis();
-    confirmLiberar = false;
-    confirmDateTime = ahora;
-    strncpy(confirmMatricula, matricula, 8);
-    confirmMatricula[8] = '\0';
-
-    // Mostrar pantalla inicial
-    ui.drawConfirmRelease(3, true);
-    Serial.printf("[CONFIRM] Iniciada para matrícula %s\n", matricula);
-}
-
-// ─────────────────────────────────────────────────────────────
-// ProcesarConfirmacion — procesa el estado de confirmación
-// Se llama en CADA iteración del loop principal
-// Retorna true si la confirmación se completa (éxito o timeout)
-// ─────────────────────────────────────────────────────────────
-bool ProcesarConfirmacion() {
-    if (!confirmacionActiva) {
-        return false;  // No hay confirmación activa
-    }
-
-    unsigned long elapsed = millis() - confirmStartTime;
-    const unsigned long CONFIRM_TIMEOUT_MS = 3000;
-
-    // ── Verificar si el usuario tocó
-    if (M5Dial.BtnA.wasPressed() || M5Dial.Touch.getDetail().wasPressed()) {
-        confirmLiberar = true;
-        confirmacionActiva = false;
-        Serial.printf("[CONFIRM] Usuario tocó → Liberar\n");
-        return true;  // Confirmación completa
-    }
-
-    // ── Actualizar countdown si es necesario
-    int newCountdown = 3 - (elapsed / 1000);
-    if (newCountdown >= 0 && newCountdown < 3) {
-        ui.drawConfirmRelease(newCountdown, false);
-    }
-
-    // ── Verificar timeout
-    if (elapsed >= CONFIRM_TIMEOUT_MS) {
-        confirmLiberar = false;  // Timeout = no liberar
-        confirmacionActiva = false;
-        Serial.printf("[CONFIRM] Timeout → No liberar\n");
-        return true;  // Confirmación completa
-    }
-
-    return false;  // Confirmación aún en progreso
-}
-
-// ─────────────────────────────────────────────────────────────
-// FinalizarConfirmacion — ejecuta la acción tras confirmación
-// (se llama cuando ProcesarConfirmacion() devuelve true)
-// ─────────────────────────────────────────────────────────────
-void FinalizarConfirmacion(const char *matricula, DateTime ahora) {
-    char ts[20];
-    rtc.formatTime(ahora, ts, sizeof(ts));
-
-    if (confirmLiberar) {
-        // Usuario tocó → liberar espacio + abrir
-        ui.drawAccessOK(matricula, ts);
-        Buzzer_AccessOK();
-        kaizen_marcarLibre();
-        kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
-        Serial.printf("[CONFIRM] Espacio liberado para %s\n", matricula);
-    } else {
-        // Timeout → entrar sin cambiar estado
-        ui.drawAccessOK(matricula, ts);
-        Buzzer_AccessOK();
-        kaizen_registrarEvento(KaizenEvento::ACCESO_OK, matricula, millis());
-        Serial.printf("[CONFIRM] Entrada sin liberar para %s\n", matricula);
-    }
-
-    AbrirCerradura();
 }

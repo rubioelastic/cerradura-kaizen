@@ -3,88 +3,59 @@
 // espnow_kaizen.h — Comunicación ESP-NOW con el Bridge
 //                   para la Cerradura Kaizen (M5Dial)
 //
-// PROTOCOLO (compatible con TiempoRespuestaMantenimiento):
-//   | SEQ (1B) | CRC (1B) | CMD (2B) | DATA (N bytes) |
+// PROTOCOLO KAIZEN_COMPLETO:
 //
-// ROL:
-//   Bridge → Cerradura : KAIZEN_SYNC periódico (poll de estado + eventos)
-//                        KAIZEN_CONFIG (nombre espacio + lista matrículas)
-//                        KAIZEN_LIBERAR / KAIZEN_OCUPAR (control desde RNA)
-//   Cerradura → Bridge : respuestas con estado actual + cola de eventos
+//   Bridge → Cerradura (data):
+//     flags(1)      bit0=1 → acceso libre; bit0=0 → whitelist
+//                   bit1=1 → apertura remota inmediata (10 s)
+//                   bit2=1 → modo ocupación; bit2=0 → modo apertura
+//     n_mats(1)     número de matrículas en whitelist
+//     mats(n×8)     matrículas autorizadas (8 chars cada una)
+//     len_nombre(1) longitud del nombre del espacio
+//     nombre(N)     nombre del espacio (sin null terminator)
 //
-// IDENTIFICACIÓN (Opción B):
-//   El Bridge identifica este M5Dial por su MAC WiFi STA.
-//   No hay ID fijo en el firmware — el Bridge asigna el nombre del espacio.
-//
-// ESTADO DEL ESPACIO:
-//   LIBRE   → nadie dentro (o liberado por Bridge / tarjeta maestra)
-//   OCUPADO → alguien entró con tarjeta válida (o Bridge forzó OCUPADO)
-//   El pulsador interior abre la puerta física pero NO cambia el estado.
-//   Solo el Bridge puede liberar (salvo tarjeta maestra de emergencia local).
+//   Cerradura → Bridge (K_OK data):
+//     n_fichajes(1)   máx KAIZEN_MAX_FICHAJES_RESP
+//     fichajes(N×14)  matricula(8) + epoch(4LE) + autorizado(1) + tipo(1)
+//                     tipo: 0=acceso, 1=ocupar, 2=liberar
+//     Buffer NVS se borra solo tras confirmar el envío.
 // ============================================================
 
 #include <Arduino.h>
 
 // ─────────────────────────────────────────────────────────────
-// Comandos Bridge → Cerradura
+// Comandos
 // ─────────────────────────────────────────────────────────────
-#define KAIZEN_SYNC     0x0C00  // Poll periódico: pide estado + recoge eventos
-#define KAIZEN_CONFIG   0x0C01  // Nombre espacio + lista matrículas autorizadas
-#define KAIZEN_LIBERAR  0x0C02  // Fuerza estado LIBRE (fin ensayo, etc.)
-#define KAIZEN_OCUPAR   0x0C03  // Fuerza estado OCUPADO desde RNA
-#define KAIZEN_COMPLETO 0x00B0  // Mensaje único cíclico (reemplaza SYNC+CONFIG+LIBERAR+OCUPAR)
-                                //   data recibida: flags(1) + tiempo_ms(4LE) + id(4LE) +
-                                //                  n_mats(1) + mats(n×8) + len_nombre(1) + nombre
-                                //   flags bit0: estado forzado (0=LIBRE,1=OCUPADO)
-                                //   flags bit1: modo_estado activo
-                                //
-                                //   respuesta OK — formato compatible Bridge/ReactionTime:
-                                //     mix(1) + n_accesos(1) + [mat(8)] × n_accesos
-                                //     mix bit0 = estado actual (0=LIBRE, 1=OCUPADO)
-                                //     mix bit1 = nombre configurado
-                                //     mix bit2 = hubo apertura manual en este ciclo
-                                //     mix bit3 = hubo acceso denegado en este ciclo
-                                //   Solo se envían matriculas de ACCESO_OK (8 bytes c/u).
-                                //   APERTURA_MANUAL y ACCESO_DENEGADO se notifican via mix bits.
+#define KAIZEN_COMPLETO   0x00B0  // Mensaje único cíclico Bridge↔Cerradura
 
-// Comandos del protocolo base (reutilizados de TRM)
-#define K_OK            0xFFFE
-#define K_DISCONNECT    0xFFFB
-#define K_ACK           0xFFF8
-#define K_NOTFOUND      0xFFF6
-#define K_BAD_SECUENCE  0xFFF4
-#define K_BAD_CRC       0xFFF3
-#define K_ASK_VERSION   0xFFEE
-#define K_UPDATE        0xFFED
+#define K_OK              0xFFFE
+#define K_DISCONNECT      0xFFFB
+#define K_ACK             0xFFF8
+#define K_NOTFOUND        0xFFF6
+#define K_BAD_SECUENCE    0xFFF4
+#define K_BAD_CRC         0xFFF3
+#define K_ASK_VERSION     0xFFEE
+#define K_UPDATE          0xFFED
 
 // ─────────────────────────────────────────────────────────────
-// Estado del espacio
+// Tipo de evento de un fichaje
 // ─────────────────────────────────────────────────────────────
-enum class EstadoEspacio : uint8_t {
-    LIBRE   = 0,
-    OCUPADO = 1
+#define KAIZEN_EVENTO_ACCESO   0  // La tarjeta abre la puerta
+#define KAIZEN_EVENTO_OCUPAR   1  // Sala marcada ocupada (mantuvo 5 s)
+#define KAIZEN_EVENTO_LIBERAR  2  // Sala liberada (mantuvo 5 s)
+
+// ─────────────────────────────────────────────────────────────
+// Registro de fichaje
+// ─────────────────────────────────────────────────────────────
+struct KaizenFichaje {
+    char     matricula[8];  // 8 chars, sin null terminator
+    uint32_t epoch;         // segundos Unix desde 1970-01-01
+    uint8_t  autorizado;    // 1=acceso concedido, 0=acceso denegado
+    uint8_t  tipo;          // KAIZEN_EVENTO_*
 };
 
 // ─────────────────────────────────────────────────────────────
-// Tipos de evento (cola que se envía en la respuesta a KAIZEN_SYNC)
-// ─────────────────────────────────────────────────────────────
-enum class KaizenEvento : uint8_t {
-    ACCESO_OK       = 0x01,  // Tarjeta válida → puerta abierta
-    ACCESO_DENEGADO = 0x02,  // Tarjeta rechazada (no autorizada / fuera de horario)
-    APERTURA_MANUAL = 0x03   // Pulsador interior pulsado
-};
-
-// ─────────────────────────────────────────────────────────────
-// Estructura de evento pendiente de enviar al Bridge
-// ─────────────────────────────────────────────────────────────
-struct KaizenEventoPendiente {
-    KaizenEvento tipo;
-    char     matricula[9]; // 8 chars + '\0'
-    uint32_t timestamp;    // millis() en el momento del evento
-};
-
-// ─────────────────────────────────────────────────────────────
-// Estructura de mensaje ESP-NOW (igual que TRM)
+// Estructura de mensaje ESP-NOW
 // ─────────────────────────────────────────────────────────────
 #define K_MAX_MSG 250
 struct KaizenMsg {
@@ -97,82 +68,47 @@ struct KaizenMsg {
 // ─────────────────────────────────────────────────────────────
 // Constantes de configuración
 // ─────────────────────────────────────────────────────────────
-#define KAIZEN_WIFI_CHANNEL      1
-#define KAIZEN_MAX_EVENTOS       8
-#define KAIZEN_TIMEOUT_BRIDGE_MS 120000UL  // 2 min sin mensaje → sin cobertura
-#define KAIZEN_FIRMWARE_VERSION  2  // v2: persistencia de estado en NVS (Preferences)
-#define KAIZEN_TIMEOUT_SEND_MS   2000
-
-// ─────────────────────────────────────────────────────────────
-// Callback que main.cpp registra para aplicar la CONFIG del Bridge:
-//   mats    → puntero a array de matrículas (8 bytes cada una)
-//   n       → número de matrículas
-//   nombre  → nombre del espacio asignado por el Bridge
-// ─────────────────────────────────────────────────────────────
-typedef void (*KaizenConfigCb)(const uint8_t *mats, uint8_t n, const char *nombre);
+#define KAIZEN_WIFI_CHANNEL       1
+#define KAIZEN_MAX_FICHAJES       50    // Capacidad del buffer offline en NVS
+#define KAIZEN_MAX_FICHAJES_RESP  17    // Máx fichajes por respuesta (1+17×14=239 ≤ 246)
+#define KAIZEN_MAX_WHITELIST      200   // Máx matrículas en whitelist
+#define KAIZEN_FICHAJE_SIZE       14    // Bytes en wire: mat(8)+epoch(4LE)+aut(1)+tipo(1)
+#define KAIZEN_TIMEOUT_BRIDGE_MS  120000UL
+#define KAIZEN_FIRMWARE_VERSION   2
+#define KAIZEN_TIMEOUT_SEND_MS    2000
 
 // ============================================================
-// API PÚBLICA (Declaraciones)
+// API PÚBLICA
 // ============================================================
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_begin — inicializa WiFi en modo STA + ESP-NOW
-//   Llamar desde setup(), después de M5Dial.begin()
-//   Devuelve false si ESP-NOW no pudo iniciarse.
-// ─────────────────────────────────────────────────────────────
-bool kaizen_begin();
+// Inicializa ESP-NOW y restaura whitelist + fichajes pendientes de NVS
+bool         kaizen_begin();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_setConfigCallback — registra la función que procesa
-//   la lista de matrículas enviada por el Bridge en KAIZEN_CONFIG
-// ─────────────────────────────────────────────────────────────
-void kaizen_setConfigCallback(KaizenConfigCb cb);
+// Llamar en cada loop(): procesa mensajes entrantes y timeout del Bridge
+void         kaizen_tick();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_tick — llamar en cada iteración de loop()
-//   Procesa mensajes entrantes y detecta timeout del Bridge
-// ─────────────────────────────────────────────────────────────
-void kaizen_tick();
+bool         kaizen_isBridgeOK();
+uint32_t     kaizen_tiempoSinBridge();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_marcarOcupado — llamar justo antes de AbrirCerradura()
-//   cuando el acceso ha sido concedido por RFID.
-//   Marca el espacio como OCUPADO con la matrícula del ocupante.
-// ─────────────────────────────────────────────────────────────
-void kaizen_marcarOcupado(const char *matricula);
+// Devuelve true UNA sola vez cuando llegó nueva config del Bridge
+bool         kaizen_hayEstadoCambio();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_marcarLibre — liberar localmente (tarjeta maestra de emergencia)
-// ─────────────────────────────────────────────────────────────
-void kaizen_marcarLibre();
+const char*  kaizen_getNombre();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_registrarEvento — encola un evento para el próximo SYNC
-//   El Bridge lo recibirá en la siguiente respuesta a KAIZEN_SYNC.
-// ─────────────────────────────────────────────────────────────
-void kaizen_registrarEvento(KaizenEvento tipo, const char *matricula, uint32_t ts);
+// ── Acceso ────────────────────────────────────────────────────
+// true si el Bridge indicó modo acceso libre (cualquiera entra)
+bool         kaizen_accesoLibre();
 
-// ─────────────────────────────────────────────────────────────
-// Getters de estado para la UI y lógica principal
-// ─────────────────────────────────────────────────────────────
-EstadoEspacio kaizen_getEstado();
-bool          kaizen_isBridgeOK();
-bool          kaizen_isModoEstado();
-const char*   kaizen_getNombre();
-const char*   kaizen_getOcupante();
+// true si el Bridge configuró modo ocupación (false = modo apertura)
+bool         kaizen_modoOcupacion();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_tiempoSinBridge — milisegundos transcurridos desde el
-//   último mensaje recibido del Bridge.
-//   - Devuelve 0           si _kBridgeOK es true (hay cobertura).
-//   - Devuelve UINT32_MAX  si nunca se ha recibido ningún mensaje.
-//   - Devuelve el tiempo real si el Bridge se ha perdido por timeout.
-//   Útil para mostrar en pantalla o para lógica de reintentos.
-// ─────────────────────────────────────────────────────────────
-uint32_t kaizen_tiempoSinBridge();
+// true si el Bridge solicitó apertura remota (se limpia al leer)
+bool         kaizen_hayAperturaRemota();
 
-// ─────────────────────────────────────────────────────────────
-// kaizen_hayEstadoCambio — Devuelve true UNA sola vez cuando el
-//   estado cambió desde la última consulta
-// ─────────────────────────────────────────────────────────────
-bool kaizen_hayEstadoCambio();
+// true si la matrícula (8 chars) está en la whitelist
+bool         kaizen_estaAutorizado(const char *matricula);
+
+// ── Fichajes ─────────────────────────────────────────────────
+// Encola un fichaje en el buffer NVS; se enviará en el próximo KAIZEN_COMPLETO
+void         kaizen_registrarFichaje(const char *matricula, bool autorizado,
+                                     uint32_t epoch, uint8_t tipo);

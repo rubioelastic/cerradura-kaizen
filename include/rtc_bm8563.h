@@ -250,8 +250,24 @@ public:
         }
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Indica si la batería del RTC estaba baja en el arranque
+    // ─────────────────────────────────────────────────────────    // toEpoch — convierte DateTime a segundos Unix (UTC aproximado)
+    // ─────────────────────────────────────────────────────────────
+    uint32_t toEpoch(const DateTime &dt) {
+        uint32_t days = 0;
+        for (uint16_t y = 1970; y < dt.year; y++) {
+            days += ((y % 4 == 0) && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+        }
+        static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        for (uint8_t m = 1; m < dt.month; m++) {
+            days += dim[m - 1];
+            if (m == 2 && (dt.year % 4 == 0) &&
+                (dt.year % 100 != 0 || dt.year % 400 == 0)) days++;
+        }
+        days += dt.day - 1;
+        return days * 86400UL + dt.hour * 3600UL + dt.minute * 60UL + dt.second;
+    }
+
+    // ─────────────────────────────────────────────────────────────    // Indica si la batería del RTC estaba baja en el arranque
     // (puede significar que la hora no es fiable)
     // ─────────────────────────────────────────────────────────
     bool isVoltLow() const { return _voltLow; }

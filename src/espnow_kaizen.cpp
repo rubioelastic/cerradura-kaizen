@@ -3,8 +3,8 @@
 #include <esp_now.h>
 #include <esp_idf_version.h>
 #include <Preferences.h>
-#include <Update.h>            // OTA via ESP-NOW (mismo protocolo que ReactionTime)
-#include <esp_task_wdt.h>      // hard_reset via watchdog
+#include <Update.h>
+#include <esp_task_wdt.h>
 
 extern "C" {
 #include "esp_wifi.h"
@@ -13,56 +13,94 @@ extern "C" {
 // ============================================================
 // Variables internas del módulo (prefijo _ = privadas)
 // ============================================================
-static Preferences           _kPrefs;
-static EstadoEspacio         _kEstado         = EstadoEspacio::LIBRE;
-static char                  _kNombre[32]     = "Sin config";
-static char                  _kOcupante[9]    = {0};
-static bool                  _kBridgeOK       = false;
-static bool                  _kModoEstado     = false; // false=solo acceso, true=acceso+estado
-static uint8_t               _kMacBridge[6]   = {0};
-static uint32_t              _kTUltimoMsg     = 0;
-static bool                  _kEstadoCambio   = false;
+static Preferences  _kPrefs;
+static char         _kNombre[32]    = "Sin config";
+static bool         _kBridgeOK      = false;
+static uint8_t      _kMacBridge[6]  = {0};
+static uint32_t     _kTUltimoMsg    = 0;
+static bool         _kEstadoCambio  = false;
 
-static KaizenEventoPendiente _kEventos[KAIZEN_MAX_EVENTOS];
-static uint8_t               _kNEventos       = 0;
+// ── Whitelist (restaurada de NVS al arrancar)
+static char    _kWhitelist[KAIZEN_MAX_WHITELIST][8];
+static uint8_t _kNWhitelist   = 0;
+static bool    _kAccesoLibre    = false;
+static bool    _kAperturaRemota = false;
+static bool    _kModoOcupacion  = false;
 
-static volatile bool     _kMsgRecibido  = false;
-static volatile bool     _kMsgEnviado   = false;
-static volatile bool     _kMsgEnviadoOK = false;
-static KaizenMsg         _kMsgIn;
-static volatile uint8_t  _kLenMsgIn    = 0;
-static KaizenMsg         _kMsgResp;
-static uint8_t           _kLenMsgResp  = 0;
-static uint8_t           _kSeqEsperada = 0;
-static bool              _kPrimerACK   = true;
+// ── Buffer de fichajes pendientes (respaldado en NVS)
+static KaizenFichaje _kFichajes[KAIZEN_MAX_FICHAJES];
+static uint8_t       _kNFichajes = 0;
 
-static KaizenConfigCb    _kCbConfig    = nullptr;
+static volatile bool    _kMsgRecibido  = false;
+static volatile bool    _kMsgEnviado   = false;
+static volatile bool    _kMsgEnviadoOK = false;
+static KaizenMsg        _kMsgIn;
+static volatile uint8_t _kLenMsgIn    = 0;
+static KaizenMsg        _kMsgResp;
+static uint8_t          _kLenMsgResp  = 0;
+static uint8_t          _kSeqEsperada = 0;
+static bool             _kPrimerACK   = true;
 
 // ── OTA via ESP-NOW
-static uint32_t          _kOtaTotal    = 0;
-static uint32_t          _kOtaProgress = 0;
-static bool              _kOtaStarted  = false;
+static uint32_t _kOtaTotal    = 0;
+static uint32_t _kOtaProgress = 0;
+static bool     _kOtaStarted  = false;
 
 // ─────────────────────────────────────────────────────────────
-// Persistencia NVS del estado del espacio
+// Persistencia NVS — Whitelist
 // ─────────────────────────────────────────────────────────────
-static void _kNvsSave() {
+static void _kSaveWhitelist() {
     _kPrefs.begin("kaizen", false);
-    _kPrefs.putUChar("estado",   (uint8_t)_kEstado);
-    _kPrefs.putString("ocupante", _kOcupante);
+    _kPrefs.putBool("libre",    _kAccesoLibre);
+    _kPrefs.putBool("modo",     _kModoOcupacion);
+    _kPrefs.putUChar("nwl",     _kNWhitelist);
+    if (_kNWhitelist > 0) {
+        _kPrefs.putBytes("wl", _kWhitelist, _kNWhitelist * 8);
+    }
+    _kPrefs.putString("nombre", _kNombre);
     _kPrefs.end();
 }
 
-static void _kNvsLoad() {
-    _kPrefs.begin("kaizen", true); // read-only
-    _kEstado = (EstadoEspacio)_kPrefs.getUChar("estado", (uint8_t)EstadoEspacio::LIBRE);
-    String ocp = _kPrefs.getString("ocupante", "");
-    strncpy(_kOcupante, ocp.c_str(), 8);
-    _kOcupante[8] = '\0';
+static void _kLoadWhitelist() {
+    _kPrefs.begin("kaizen", true);
+    _kAccesoLibre   = _kPrefs.getBool("libre", false);
+    _kModoOcupacion = _kPrefs.getBool("modo",  false);
+    _kNWhitelist    = _kPrefs.getUChar("nwl",  0);
+    if (_kNWhitelist > KAIZEN_MAX_WHITELIST) _kNWhitelist = KAIZEN_MAX_WHITELIST;
+    if (_kNWhitelist > 0) {
+        _kPrefs.getBytes("wl", _kWhitelist, _kNWhitelist * 8);
+    }
+    String n = _kPrefs.getString("nombre", "Sin config");
+    strncpy(_kNombre, n.c_str(), 31);
+    _kNombre[31] = '\0';
     _kPrefs.end();
-    Serial.printf("[NVS] Estado restaurado: %s  Ocupante: '%s'\n",
-                  _kEstado == EstadoEspacio::OCUPADO ? "OCUPADO" : "LIBRE",
-                  _kOcupante);
+    Serial.printf("[NVS] Whitelist: %u mats, libre=%d, nombre='%s'\n",
+                  _kNWhitelist, (int)_kAccesoLibre, _kNombre);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Persistencia NVS — Buffer de fichajes
+// ─────────────────────────────────────────────────────────────
+static void _kSaveFichajes() {
+    _kPrefs.begin("kaizen", false);
+    _kPrefs.putUChar("fcnt", _kNFichajes);
+    if (_kNFichajes > 0) {
+        _kPrefs.putBytes("fdata", _kFichajes,
+                         _kNFichajes * sizeof(KaizenFichaje));
+    }
+    _kPrefs.end();
+}
+
+static void _kLoadFichajes() {
+    _kPrefs.begin("kaizen", true);
+    _kNFichajes = _kPrefs.getUChar("fcnt", 0);
+    if (_kNFichajes > KAIZEN_MAX_FICHAJES) _kNFichajes = KAIZEN_MAX_FICHAJES;
+    if (_kNFichajes > 0) {
+        _kPrefs.getBytes("fdata", _kFichajes,
+                         _kNFichajes * sizeof(KaizenFichaje));
+    }
+    _kPrefs.end();
+    Serial.printf("[NVS] Fichajes pendientes: %u\n", _kNFichajes);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -211,6 +249,9 @@ static void _kProcesar() {
         return;
     }
 
+    if (!_kBridgeOK) {
+        Serial.println("[ESPNOW] *** BRIDGE ONLINE ***");
+    }
     _kTUltimoMsg = millis();
     _kBridgeOK   = true;
 
@@ -228,136 +269,66 @@ static void _kProcesar() {
             break;
         }
 
-        case KAIZEN_SYNC: {
-            // Bridge pide estado actual + eventos pendientes
-            // Respuesta: estado(1) + ocupante(8) + n_eventos(1) + [eventos: tipo(1)+mat(8)+ts(4)]
-            uint8_t buf[10 + KAIZEN_MAX_EVENTOS * 13];
-            uint16_t pos = 0;
-            buf[pos++] = (uint8_t)_kEstado;
-            memcpy(&buf[pos], _kOcupante, 8); pos += 8;
-            buf[pos++] = _kNEventos;
-            for (uint8_t i = 0; i < _kNEventos; i++) {
-                buf[pos++] = (uint8_t)_kEventos[i].tipo;
-                memcpy(&buf[pos], _kEventos[i].matricula, 8); pos += 8;
-                memcpy(&buf[pos], &_kEventos[i].timestamp, 4); pos += 4;
-            }
-            if (_kResponder(K_OK, buf, (uint8_t)pos)) {
-                _kNEventos = 0; // Eventos confirmados: vaciar cola
-            }
-            break;
-        }
-
-        case KAIZEN_CONFIG: {
-            // data: [flags(1)] [len_nombre(1)] [nombre(N)] [n_mats(1)] [mat0(8)] ...
-            // flags bit0 = modo_estado (0=solo acceso, 1=acceso+estado)
-            uint8_t flags     = _kMsgIn.data[0];
-            _kModoEstado      = (flags & 0x01) != 0;
-            uint8_t lenNombre = _kMsgIn.data[1];
-            if (lenNombre > 31) lenNombre = 31;
-            memcpy(_kNombre, &_kMsgIn.data[2], lenNombre);
-            _kNombre[lenNombre] = '\0';
-
-            uint8_t offset = 2 + lenNombre;
-            uint8_t nMats  = _kMsgIn.data[offset];
-
-            Serial.printf("[BRIDGE] Config: '%s', %u matrículas, modo_estado=%d\n",
-                          _kNombre, nMats, (int)_kModoEstado);
-
-            if (_kCbConfig) {
-                _kCbConfig(&_kMsgIn.data[offset + 1], nMats, _kNombre);
-            }
-            _kEstadoCambio = true; // Forzar redibujado por si cambió el modo
-            _kResponder(K_OK);
-            break;
-        }
-
-        case KAIZEN_LIBERAR: {
-            EstadoEspacio prev = _kEstado;
-            _kEstado = EstadoEspacio::LIBRE;
-            memset(_kOcupante, 0, sizeof(_kOcupante));
-            if (prev != _kEstado) { _kEstadoCambio = true; _kNvsSave(); }
-            Serial.println("[BRIDGE] Espacio liberado por Bridge");
-            _kResponder(K_OK);
-            break;
-        }
-
-        case KAIZEN_OCUPAR: {
-            EstadoEspacio prev = _kEstado;
-            _kEstado = EstadoEspacio::OCUPADO;
-            // El Bridge puede incluir una matrícula/nombre en data[0..7]
-            uint8_t lenData = _kLenMsgIn - 4;
-            if (lenData >= 8) {
-                memcpy(_kOcupante, _kMsgIn.data, 8);
-                _kOcupante[8] = '\0';
-            }
-            if (prev != _kEstado) { _kEstadoCambio = true; _kNvsSave(); }
-            Serial.println("[BRIDGE] Espacio ocupado por Bridge");
-            _kResponder(K_OK);
-            break;
-        }
 
         case KAIZEN_COMPLETO: {
-            // ── Desempaquetar flags
-            uint8_t  flags     = _kMsgIn.data[0];
-            bool     forzarOcupado = (flags & 0x01) != 0;
-            _kModoEstado           = (flags & 0x02) != 0;
-
-            // ── Tiempo y reserva (little-endian, info para futuros usos)
-            // uint32_t tiempoMs = ...; // data[1..4] — no usado localmente aún
-            // uint32_t reservaId = ...; // data[5..8]
-
-            // ── Lista de matrículas autorizadas
-            uint8_t  nMats  = _kMsgIn.data[9];
-            uint16_t cursor = 10;
-            if (_kCbConfig) {
-                _kCbConfig(&_kMsgIn.data[cursor], nMats, _kNombre); // nombre aún no leído
+            // flags(1) + n_mats(1) + mats(n×8) + len_nombre(1) + nombre
+            uint8_t flags = _kMsgIn.data[0];
+            _kAccesoLibre   = (flags & 0x01) != 0;
+            if (flags & 0x02) {
+                _kAperturaRemota = true;
+                Serial.println("[BRIDGE] Apertura remota solicitada");
             }
-            cursor += nMats * 8;
+            _kModoOcupacion = (flags & 0x04) != 0;
 
-            // ── Nombre del espacio
+            uint8_t nMats = _kMsgIn.data[1];
+            if (nMats > KAIZEN_MAX_WHITELIST) nMats = KAIZEN_MAX_WHITELIST;
+            _kNWhitelist = nMats;
+            for (uint8_t i = 0; i < nMats; i++) {
+                memcpy(_kWhitelist[i], &_kMsgIn.data[2 + i * 8], 8);
+            }
+
+            uint16_t cursor   = 2 + nMats * 8;
             uint8_t lenNombre = _kMsgIn.data[cursor];
             if (lenNombre > 31) lenNombre = 31;
             if (lenNombre > 0) {
                 memcpy(_kNombre, &_kMsgIn.data[cursor + 1], lenNombre);
-                _kNombre[lenNombre] = '\0';
             }
+            _kNombre[lenNombre] = '\0';
 
-            // ── Aplicar estado forzado del Bridge
-            EstadoEspacio estadoBridge = forzarOcupado ? EstadoEspacio::OCUPADO : EstadoEspacio::LIBRE;
-            if (estadoBridge != _kEstado) {
-                _kEstado = estadoBridge;
-                if (!forzarOcupado) memset(_kOcupante, 0, sizeof(_kOcupante));
-                _kEstadoCambio = true;
-                _kNvsSave();
-                Serial.printf("[BRIDGE] Estado forzado a: %s\n",
-                              forzarOcupado ? "OCUPADO" : "LIBRE");
-            }
-            _kEstadoCambio = true; // Forzar redibujado siempre (puede haber cambiado nombre/mats)
+            _kSaveWhitelist();
+            _kEstadoCambio = true;
 
-            // ── Construir respuesta compatible con Bridge (mismo formato que ReactionTime):
-            //    mix(1) + n_accesos(1) + [mat(8)] × n_accesos
-            uint8_t mix = 0;
-            if (_kEstado == EstadoEspacio::OCUPADO) mix |= 0x01; // bit0 = estado actual
-            if (lenNombre > 0)                      mix |= 0x02; // bit1 = nombre configurado
+            Serial.printf("[BRIDGE] libre=%d mats=%u nombre='%s'\n",
+                          (int)_kAccesoLibre, nMats, _kNombre);
 
-            // Clasificar eventos: OK → matriculas a enviar; otros → flags en mix
-            uint8_t nOK = 0;
-            for (uint8_t i = 0; i < _kNEventos; i++) {
-                if      (_kEventos[i].tipo == KaizenEvento::ACCESO_OK)       nOK++;
-                else if (_kEventos[i].tipo == KaizenEvento::APERTURA_MANUAL) mix |= 0x04; // bit2
-                else if (_kEventos[i].tipo == KaizenEvento::ACCESO_DENEGADO) mix |= 0x08; // bit3
-            }
-
-            uint8_t buf[2 + KAIZEN_MAX_EVENTOS * 8];
+            // Respuesta: n_fichajes(1) + [mat(8)+epoch(4LE)+aut(1)]×n
+            uint8_t nResp = (_kNFichajes < KAIZEN_MAX_FICHAJES_RESP)
+                          ? _kNFichajes : KAIZEN_MAX_FICHAJES_RESP;
+            uint8_t buf[1 + KAIZEN_MAX_FICHAJES_RESP * KAIZEN_FICHAJE_SIZE];
             uint16_t pos = 0;
-            buf[pos++] = mix;
-            buf[pos++] = nOK;
-            for (uint8_t i = 0; i < _kNEventos; i++) {
-                if (_kEventos[i].tipo != KaizenEvento::ACCESO_OK) continue;
-                memcpy(&buf[pos], _kEventos[i].matricula, 8); pos += 8;
+            buf[pos++] = nResp;
+            for (uint8_t i = 0; i < nResp; i++) {
+                memcpy(&buf[pos], _kFichajes[i].matricula, 8); pos += 8;
+                buf[pos++] = (_kFichajes[i].epoch >>  0) & 0xFF;
+                buf[pos++] = (_kFichajes[i].epoch >>  8) & 0xFF;
+                buf[pos++] = (_kFichajes[i].epoch >> 16) & 0xFF;
+                buf[pos++] = (_kFichajes[i].epoch >> 24) & 0xFF;
+                buf[pos++] = _kFichajes[i].autorizado;
+                buf[pos++] = _kFichajes[i].tipo;
             }
+
             if (_kResponder(K_OK, buf, (uint8_t)pos)) {
-                _kNEventos = 0; // Eventos confirmados
+                if (nResp > 0) {
+                    uint8_t remaining = _kNFichajes - nResp;
+                    if (remaining > 0) {
+                        memmove(_kFichajes, _kFichajes + nResp,
+                                remaining * sizeof(KaizenFichaje));
+                    }
+                    _kNFichajes = remaining;
+                    _kSaveFichajes();
+                    Serial.printf("[BRIDGE] %u fichajes enviados, %u pendientes\n",
+                                  nResp, remaining);
+                }
             }
             break;
         }
@@ -450,8 +421,8 @@ static void _kProcesar() {
 // ============================================================
 
 bool kaizen_begin() {
-    _kNvsLoad(); // Restaurar estado del espacio desde NVS
-    _kEstadoCambio = true; // Forzar redibujado con el estado restaurado
+    _kLoadWhitelist();
+    _kLoadFichajes();
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, true); // desconectar de AP (borra credenciales) pero mantiene el radio ON
@@ -465,17 +436,12 @@ bool kaizen_begin() {
     esp_now_register_send_cb(_kOnSent);
 
     // Mostrar MAC por serie para que el Bridge pueda registrar este dispositivo
-    uint8_t mac[6];
-    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
-        Serial.printf("[ESPNOW] MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    }
+    String mac = WiFi.macAddress();
+    Serial.printf("[ESPNOW] MAC: %s\n", mac.c_str());
 
     Serial.println("[ESPNOW] Esperando Bridge...");
     return true;
 }
-
-void kaizen_setConfigCallback(KaizenConfigCb cb) { _kCbConfig = cb; }
 
 void kaizen_tick() {
     if (_kBridgeOK && (millis() - _kTUltimoMsg >= KAIZEN_TIMEOUT_BRIDGE_MS)) {
@@ -488,39 +454,45 @@ void kaizen_tick() {
     _kProcesar();
 }
 
-void kaizen_marcarOcupado(const char *matricula) {
-    _kEstado = EstadoEspacio::OCUPADO;
-    strncpy(_kOcupante, matricula, 8);
-    _kOcupante[8] = '\0';
-    _kEstadoCambio = true;
-    _kNvsSave();
+bool        kaizen_isBridgeOK()       { return _kBridgeOK; }
+const char* kaizen_getNombre()        { return _kNombre; }
+bool        kaizen_accesoLibre()      { return _kAccesoLibre; }
+bool        kaizen_modoOcupacion()    { return _kModoOcupacion; }
+
+bool kaizen_hayAperturaRemota() {
+    bool v = _kAperturaRemota;
+    _kAperturaRemota = false;
+    return v;
 }
 
-void kaizen_marcarLibre() {
-    _kEstado = EstadoEspacio::LIBRE;
-    memset(_kOcupante, 0, sizeof(_kOcupante));
-    _kEstadoCambio = true;
-    _kNvsSave();
+bool kaizen_estaAutorizado(const char *matricula) {
+    for (uint8_t i = 0; i < _kNWhitelist; i++) {
+        if (memcmp(_kWhitelist[i], matricula, 8) == 0) return true;
+    }
+    return false;
 }
 
-void kaizen_registrarEvento(KaizenEvento tipo, const char *matricula, uint32_t ts) {
-    if (_kNEventos >= KAIZEN_MAX_EVENTOS) return;
-    _kEventos[_kNEventos].tipo = tipo;
-    strncpy(_kEventos[_kNEventos].matricula, matricula ? matricula : "", 8);
-    _kEventos[_kNEventos].matricula[8] = '\0';
-    _kEventos[_kNEventos].timestamp = ts;
-    _kNEventos++;
+void kaizen_registrarFichaje(const char *matricula, bool autorizado,
+                             uint32_t epoch, uint8_t tipo) {
+    if (_kNFichajes >= KAIZEN_MAX_FICHAJES) {
+        // Buffer lleno: descartar el más antiguo
+        memmove(_kFichajes, _kFichajes + 1,
+                (KAIZEN_MAX_FICHAJES - 1) * sizeof(KaizenFichaje));
+        _kNFichajes = KAIZEN_MAX_FICHAJES - 1;
+    }
+    memcpy(_kFichajes[_kNFichajes].matricula, matricula, 8);
+    _kFichajes[_kNFichajes].epoch      = epoch;
+    _kFichajes[_kNFichajes].autorizado = autorizado ? 1u : 0u;
+    _kFichajes[_kNFichajes].tipo       = tipo;
+    _kNFichajes++;
+    _kSaveFichajes();
+    Serial.printf("[FICHAJE] %c%.8s epoch=%u tipo=%u\n",
+                  autorizado ? '+' : '-', matricula, epoch, tipo);
 }
-
-EstadoEspacio kaizen_getEstado()       { return _kEstado; }
-bool          kaizen_isBridgeOK()      { return _kBridgeOK; }
-bool          kaizen_isModoEstado()    { return _kModoEstado; }
-const char*   kaizen_getNombre()       { return _kNombre; }
-const char*   kaizen_getOcupante()     { return _kOcupante; }
 
 uint32_t kaizen_tiempoSinBridge() {
-    if (_kBridgeOK)       return 0;          // Conectado — sin tiempo perdido
-    if (_kTUltimoMsg == 0) return UINT32_MAX; // Nunca hubo contacto
+    if (_kBridgeOK)        return 0;
+    if (_kTUltimoMsg == 0) return UINT32_MAX;
     return millis() - _kTUltimoMsg;
 }
 

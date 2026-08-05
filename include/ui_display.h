@@ -374,6 +374,35 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────
+    // Pantalla MANTENER — cuenta atrás para ocupar o liberar.
+    //   accion: "OCUPAR" o "LIBERAR"
+    //   fullDraw=false actualiza solo el número (sin redibujar todo)
+    // ─────────────────────────────────────────────────────────
+    void drawMantener(const char *accion, int countdown, bool fullDraw = true) {
+        if (fullDraw) {
+            _currentState = UI_STATE_OCUPADO;
+            _disp.fillScreen(0x2800);
+            _disp.drawCircle(120, 120, 115, COL_ORANGE);
+            _disp.drawCircle(120, 120, 113, COL_ORANGE);
+            drawLockIcon(120, 50, COL_ORANGE, false);
+            _disp.setTextSize(1);
+            _disp.setTextColor(COL_WHITE);
+            _disp.setTextDatum(MC_DATUM);
+            _disp.drawString("Manten para", 120, 108);
+            _disp.setTextSize(2);
+            _disp.setTextColor(COL_ORANGE);
+            _disp.drawString(accion, 120, 128);
+        }
+        _disp.fillRect(95, 160, 50, 45, 0x2800);
+        _disp.setTextSize(3);
+        _disp.setTextColor(COL_YELLOW);
+        _disp.setTextDatum(MC_DATUM);
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%d", countdown);
+        _disp.drawString(buf, 120, 183);
+    }
+
+    // ─────────────────────────────────────────────────────────
     // Pantalla ESPACIO LIBRE (Bridge conectado)
     //   Fondo verde oscuro, candado abierto, texto grande "LIBRE",
     //   nombre del espacio, reloj.
