@@ -267,7 +267,47 @@ public:
         return days * 86400UL + dt.hour * 3600UL + dt.minute * 60UL + dt.second;
     }
 
-    // ─────────────────────────────────────────────────────────────    // Indica si la batería del RTC estaba baja en el arranque
+    // ─────────────────────────────────────────────────────────
+    // setEpoch — fija el RTC a partir de un epoch Unix local
+    // ─────────────────────────────────────────────────────────
+    void setEpoch(uint32_t epoch) {
+        uint32_t days = epoch / 86400UL;
+        uint32_t rem  = epoch % 86400UL;
+        uint8_t  hour   = (uint8_t)(rem / 3600);
+        uint8_t  minute = (uint8_t)((rem % 3600) / 60);
+        uint8_t  second = (uint8_t)(rem % 60);
+
+        uint16_t year = 1970;
+        while (true) {
+            uint32_t diy = ((year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)) ? 366u : 365u;
+            if (days < diy) break;
+            days -= diy;
+            year++;
+        }
+
+        static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        uint8_t month = 1;
+        for (; month <= 12; month++) {
+            uint8_t d = dim[month - 1];
+            if (month == 2 && (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)) d = 29;
+            if (days < d) break;
+            days -= d;
+        }
+        uint8_t day = (uint8_t)(days + 1);
+
+        // Día de la semana (algoritmo de Tomohiko Sakamoto)
+        static const int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+        int y = (int)year - (month < 3 ? 1 : 0);
+        uint8_t weekday = (uint8_t)((y + y/4 - y/100 + y/400 + t[month-1] + day) % 7);
+
+        DateTime dt;
+        dt.year = year; dt.month = month; dt.day = day; dt.weekday = weekday;
+        dt.hour = hour; dt.minute = minute; dt.second = second; dt.valid = true;
+        setDateTime(dt);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Indica si la batería del RTC estaba baja en el arranque
     // (puede significar que la hora no es fiable)
     // ─────────────────────────────────────────────────────────
     bool isVoltLow() const { return _voltLow; }

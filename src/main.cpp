@@ -77,8 +77,12 @@
 // CONSTANTES DE CONFIGURACIÓN
 // ─────────────────────────────────────────────────────────────
 
-// Tiempo que la cerradura permanece abierta (ms)
-#define TIEMPO_ABIERTA_MS  3000
+// Tiempo de gracia tras retirar la tarjeta (relé sigue abierto)
+#define TIEMPO_GRACIA_MS   3000
+// Tiempo que hay que mantener la tarjeta para alternar ocupar/liberar
+#define HOLD_OCUPAR_MS     2000
+// Tope absoluto de apertura (seguridad: si el RFID no detecta retirada)
+#define MAX_APERTURA_MS   30000
 
 // Frecuencias del buzzer
 #define FREQ_ACCESS_OK     1000
@@ -123,15 +127,20 @@ KaizenRTC rtc;
 bool  SonIguales(char *m1, char *m2);
 void  ReadEmpleado(char *empleado);
 bool  Es0(char *matricula);
-void  AbrirCerradura();
+void  AbrirCerradura(const char *matricula);
 void  AbrirCerraduraRemota();
+void  EsperarRetiradaYCerrar(const char *matricula);
 void  AccesoOcupacion(const char *matricula, uint32_t epoch);
 void  GuardarEstadoSala();
 void  CopiarMatricula(char *origen, char *destino);
 void  Buzzer_AccessOK();
 void  Buzzer_AccessDeny();
 void  Buzzer_Beep(uint32_t freq, uint32_t durMs);
+void  Buzzer_Ocupar();
+void  Buzzer_Liberar();
+void  Buzzer_Cancelar();
 void  ActualizarPantallaIdle();
+void  ActualizarReloj();
 
 // ─────────────────────────────────────────────────────────────
 // VARIABLES GLOBALES
@@ -145,7 +154,8 @@ uint32_t lastMatriculaMs  = 0;
 
 // Estado de ocupación (persistente en NVS)
 Preferences salaPrefs;
-bool        salaOcupada = false;
+bool        salaOcupada          = false;
+char        matriculaOcupante[9] = "";   // Quién ocupa la sala (8 chars + '\0')
 
 // ============================================================
 //  S E T U P
@@ -161,13 +171,12 @@ void setup() {
     ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
 
     ui.begin();
+    ui.setFwVersion(KAIZEN_FIRMWARE_VERSION);
 
     if (!rtc.begin()) {
         ui.drawError("Fallo RTC");
         Buzzer_AccessDeny();
         delay(3000);
-    } else {
-        rtc.setBuildTime();
     }
 
     Serial.begin(115200);
@@ -189,15 +198,11 @@ void setup() {
 
     salaPrefs.begin("sala", true);
     salaOcupada = salaPrefs.getBool("ocup", false);
+    salaPrefs.getBytes("mat", matriculaOcupante, 8);
+    matriculaOcupante[8] = '\0';
     salaPrefs.end();
-    Serial.printf("[SALA] Estado recuperado: %s\n", salaOcupada ? "OCUPADA" : "LIBRE");
-
-    {
-        String macAddr = WiFi.macAddress();
-        Serial.printf("[MAC] %s\n", macAddr.c_str());
-        ui.drawIdle("--:--", macAddr.c_str());
-        delay(4000);  // mostrar MAC 4 segundos
-    }
+    Serial.printf("[SALA] Estado recuperado: %s (ocupante: %.8s)\n", salaOcupada ? "OCUPADA" : "LIBRE", matriculaOcupante);
+    if (salaOcupada) kaizen_marcarOcupantePendiente(true);
 
     ActualizarPantallaIdle();
 }
@@ -209,6 +214,15 @@ void loop() {
     M5Dial.update();
     kaizen_tick();
 
+    // ── Sincronizar hora si el Bridge ha enviado nueva hora
+    uint32_t epochNuevo;
+    if (kaizen_consumirHoraPendiente(&epochNuevo)) {
+        rtc.setEpoch(epochNuevo);
+        DateTime ahora = rtc.getDateTime();
+        Serial.printf("[RTC] Hora sincronizada: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      ahora.year, ahora.month, ahora.day, ahora.hour, ahora.minute, ahora.second);
+    }
+
     if (kaizen_hayEstadoCambio()) {
         ActualizarPantallaIdle();
     }
@@ -219,10 +233,36 @@ void loop() {
         return;
     }
 
+    // ── Forzar estado de sala solicitado por el Bridge
+    if (kaizen_consumirForzarOcupar()) {
+        if (!salaOcupada) {
+            salaOcupada = true;
+            memcpy(matriculaOcupante, kaizen_getMatriculaForzada(), 8);
+            matriculaOcupante[8] = '\0';
+            GuardarEstadoSala();
+            kaizen_marcarOcupantePendiente(true);
+            Buzzer_Ocupar();
+            ActualizarPantallaIdle();
+        }
+        return;
+    }
+    if (kaizen_consumirForzarLiberar()) {
+        if (salaOcupada) {
+            salaOcupada = false;
+            memset(matriculaOcupante, 0, sizeof(matriculaOcupante));
+            GuardarEstadoSala();
+            kaizen_marcarOcupantePendiente(false);
+            Buzzer_Liberar();
+            ActualizarPantallaIdle();
+        }
+        return;
+    }
+
     if (millis() - ultimaActualizacionHora > INTERVALO_HORA_MS) {
         ultimaActualizacionHora = millis();
-        if (ui.getState() == UI_STATE_IDLE) {
-            ActualizarPantallaIdle();
+        UIState s = ui.getState();
+        if (s == UI_STATE_IDLE || s == UI_STATE_LIBRE || s == UI_STATE_OCUPADO) {
+            ActualizarReloj();
         }
     }
 
@@ -259,7 +299,7 @@ void loop() {
         if (autorizado) {
             ui.drawAccessOK(matricula, ts);
             Buzzer_AccessOK();
-            AbrirCerradura();
+            AbrirCerradura(matricula);
         } else {
             ui.drawAccessDeny(matricula, ts);
             Buzzer_AccessDeny();
@@ -278,7 +318,16 @@ void loop() {
         ActualizarPantallaIdle();
         return;
     }
-    // Tarjeta autorizada: siempre abre; mantener 5 s alterna ocupar/liberar
+    // Si la sala está OCUPADA por otro → denegar acceso completo
+    if (salaOcupada && !SonIguales(matricula, matriculaOcupante)) {
+        kaizen_registrarFichaje(matricula, false, epoch, KAIZEN_EVENTO_ACCESO);
+        ui.drawAccessDeny(matricula, ts);
+        Buzzer_AccessDeny();
+        delay(2000);
+        ActualizarPantallaIdle();
+        return;
+    }
+    // El propio ocupante o sala libre: abre; mantener 2 s alterna ocupar/liberar
     AccesoOcupacion(matricula, epoch);
 }
 
@@ -289,17 +338,32 @@ void loop() {
 // ============================================================
 
 // ─────────────────────────────────────────────────────────────
-// AbrirCerradura — activa el relé para abrir la cerradura
-// MANTENIDA del código original (misma lógica de tiempo)
-// CAMBIO: el GPIO del relé es ahora GPIO1 (header P3) en vez de GPIO5
+// EsperarRetiradaYCerrar — mantiene el relé HIGH mientras la tarjeta
+// siga presente; al retirarla espera TIEMPO_GRACIA_MS y cierra.
+// Tope de seguridad MAX_APERTURA_MS para evitar puerta siempre abierta.
 // ─────────────────────────────────────────────────────────────
-void AbrirCerradura() {
+void EsperarRetiradaYCerrar(const char *matricula) {
+    uint32_t inicio = millis();
+    char m[9];
+    while (millis() - inicio < MAX_APERTURA_MS) {
+        ReadEmpleado(m);
+        if (Es0(m) || !SonIguales((char*)matricula, m)) break;
+    }
+    delay(TIEMPO_GRACIA_MS);
+    digitalWrite(RELE, LOW);
+    ActualizarPantallaIdle();
+}
+
+// ─────────────────────────────────────────────────────────────
+// AbrirCerradura — abre el relé y espera a que se retire la tarjeta
+// (modo clásico: abierto mientras tarjeta presente + 3 s de gracia)
+// ─────────────────────────────────────────────────────────────
+void AbrirCerradura(const char *matricula) {
     ledcWriteTone(BUZZER_CHANNEL, 0);
     Serial.println("[ACCESO] Cerradura abierta");
     digitalWrite(RELE, HIGH);
-    delay(TIEMPO_ABIERTA_MS);
-    digitalWrite(RELE, LOW);
-    ActualizarPantallaIdle();
+    ui.drawAbierta();
+    EsperarRetiradaYCerrar(matricula);
 }
 
 void AbrirCerraduraRemota() {
@@ -317,51 +381,76 @@ void AbrirCerraduraRemota() {
 }
 
 void AccesoOcupacion(const char *matricula, uint32_t epoch) {
-    // 1) Registrar el acceso y abrir la puerta
+    // 1) Abrir puerta + registrar acceso
     kaizen_registrarFichaje(matricula, true, epoch, KAIZEN_EVENTO_ACCESO);
     ledcWriteTone(BUZZER_CHANNEL, 0);
     Buzzer_AccessOK();
     digitalWrite(RELE, HIGH);
+    ui.drawAbierta();   // genérico hasta confirmar intención de mantener
     Serial.println("[OCUPACION] Puerta abierta");
 
-    // 2) Detectar si mantiene la tarjeta 5 s para alternar estado.
-    //    El relé se cierra a los TIEMPO_ABIERTA_MS aunque siga manteniendo.
-    const uint32_t HOLD_MS = 5000;
-    uint32_t inicio = millis();
-    bool releCerrado = false, mantenida = true, primera = true;
-    const char *accion = salaOcupada ? "LIBERAR" : "OCUPAR";
-    char m[9];
-    while (millis() - inicio < HOLD_MS) {
-        if (!releCerrado && (millis() - inicio) >= TIEMPO_ABIERTA_MS) {
-            digitalWrite(RELE, LOW);
-            releCerrado = true;
-        }
-        int restante = (int)((HOLD_MS - (millis() - inicio)) / 1000) + 1;
-        ui.drawMantener(accion, restante, primera);
-        primera = false;
-        ReadEmpleado(m);
-        if (Es0(m) || !SonIguales((char*)matricula, m)) {
-            mantenida = false;
-            break;
-        }
-    }
-    if (!releCerrado) digitalWrite(RELE, LOW);
 
-    // 3) Se mantuvo los 5 s → alternar estado de la sala
-    if (mantenida) {
-        salaOcupada = !salaOcupada;
-        GuardarEstadoSala();
-        uint8_t tipo = salaOcupada ? KAIZEN_EVENTO_OCUPAR : KAIZEN_EVENTO_LIBERAR;
-        kaizen_registrarFichaje(matricula, true, epoch, tipo);
-        Serial.printf("[OCUPACION] Sala %s\n", salaOcupada ? "OCUPADA" : "LIBERADA");
-        Buzzer_AccessOK();
+    uint32_t inicio  = millis();
+    bool mantenida   = true;
+    char m[9];
+    while (millis() - inicio < 500) {
+            ReadEmpleado(m);
+            if (Es0(m) || !SonIguales((char*)matricula, m)) {
+                mantenida = false;
+                break;
+            }
     }
-    ActualizarPantallaIdle();
+    if (!mantenida){
+        EsperarRetiradaYCerrar(matricula);
+    }else{
+
+
+
+        // 2) Ventana de HOLD_OCUPAR_MS: si mantiene la tarjeta alterna estado.
+        inicio  = millis();
+        uint32_t siguiente  = inicio;
+        bool mantenida   = true;
+        while (millis() - inicio < HOLD_OCUPAR_MS) {
+            if (siguiente <= millis()) {
+                Buzzer_Beep(1000, 80);
+                siguiente += 250;
+                ReadEmpleado(m);
+                if (Es0(m) || !SonIguales((char*)matricula, m)) {
+                    mantenida = false;
+                    break;
+                }
+            }
+        }
+
+        // 3) Resultado según si mantuvo los 3 s completos
+        if (mantenida) {
+            salaOcupada = !salaOcupada;
+            if (salaOcupada) {
+                CopiarMatricula((char*)matricula, matriculaOcupante);
+                matriculaOcupante[8] = '\0';
+            } else {
+                memset(matriculaOcupante, 0, sizeof(matriculaOcupante));
+            }
+            GuardarEstadoSala();
+            uint8_t tipo = salaOcupada ? KAIZEN_EVENTO_OCUPAR : KAIZEN_EVENTO_LIBERAR;
+            kaizen_registrarFichaje(matricula, true, epoch, tipo);
+            kaizen_marcarOcupantePendiente(salaOcupada);
+            Serial.printf("[OCUPACION] Sala %s\n", salaOcupada ? "OCUPADA" : "LIBERADA");
+            if (salaOcupada) Buzzer_Ocupar(); else Buzzer_Liberar();
+        } else {
+            // Retiró antes de los 3 s: beep de cancelación
+            Buzzer_Cancelar();
+        }
+
+        // 4) Relé sigue abierto: esperar retirada + 3 s de gracia
+        EsperarRetiradaYCerrar(matricula);
+    }
 }
 
 void GuardarEstadoSala() {
     salaPrefs.begin("sala", false);
     salaPrefs.putBool("ocup", salaOcupada);
+    salaPrefs.putBytes("mat", matriculaOcupante, 8);
     salaPrefs.end();
 }
 
@@ -388,6 +477,21 @@ void Buzzer_Beep(uint32_t freq, uint32_t durMs) {
 void Buzzer_AccessOK() {
     Buzzer_Beep(800,  100); delay(50);
     Buzzer_Beep(1200, 200);
+}
+
+// Buzzer_Ocupar — dos tonos ascendentes: sala marcada OCUPADA
+void Buzzer_Ocupar() {
+    Buzzer_Beep(1400, 500);
+}
+
+// Buzzer_Liberar — dos tonos descendentes: sala LIBERADA
+void Buzzer_Liberar() {
+    Buzzer_Beep(1400, 500);
+}
+
+// Buzzer_Cancelar — tono grave corto: se retiró antes de tiempo
+void Buzzer_Cancelar() {
+    Buzzer_Beep(300, 400);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -424,7 +528,7 @@ void Buzzer_AccessDeny() {
 // La lógica, el bloque 4 y la clave 0xFF×6 se mantienen sin cambios.
 // ─────────────────────────────────────────────────────────────
 void ReadEmpleado(char *empleado) {
-    delay(300); // Mismo retardo que el código original
+    //delay(300); // Mismo retardo que el código original
 
     // ── Iniciar contador de timeout
     unsigned long startTime = millis();
@@ -478,9 +582,7 @@ void ReadEmpleado(char *empleado) {
 
     // ── Autenticar con el bloque 4, clave A
     byte block = 4;
-    MFRC522::StatusCode status = (MFRC522::StatusCode)M5Dial.Rfid.PCD_Authenticate(
-        MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(M5Dial.Rfid.uid)
-    );
+    MFRC522::StatusCode status = (MFRC522::StatusCode)M5Dial.Rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(M5Dial.Rfid.uid));
 
     // ── TIMEOUT CHECK: Después de Authenticate
     if (millis() - startTime > RFID_TIMEOUT_MS) {
@@ -491,8 +593,7 @@ void ReadEmpleado(char *empleado) {
     }
 
     if (status != MFRC522::STATUS_OK) {
-        Serial.printf("[RFID] Error autenticación: %s\n",
-                      M5Dial.Rfid.GetStatusCodeName(status));
+        Serial.printf("[RFID] Error autenticación: %s\n", M5Dial.Rfid.GetStatusCodeName(status));
         M5Dial.Rfid.PICC_HaltA();
         M5Dial.Rfid.PCD_StopCrypto1();
         return;
@@ -512,8 +613,7 @@ void ReadEmpleado(char *empleado) {
     }
 
     if (status != MFRC522::STATUS_OK) {
-        Serial.printf("[RFID] Error lectura: %s\n",
-                      M5Dial.Rfid.GetStatusCodeName(status));
+        Serial.printf("[RFID] Error lectura: %s\n", M5Dial.Rfid.GetStatusCodeName(status));
         M5Dial.Rfid.PICC_HaltA();
         M5Dial.Rfid.PCD_StopCrypto1();
         return;
@@ -568,21 +668,39 @@ void CopiarMatricula(char *origen, char *destino) {
 // ============================================================
 
 void ActualizarPantallaIdle() {
+    DateTime ahora = rtc.getDateTime();
+    char timeStr[8];
+    rtc.formatTime(ahora, timeStr, sizeof(timeStr));
+
     if (kaizen_modoOcupacion() && salaOcupada) {
-        ui.drawOcupado(kaizen_getNombre());
+        // Mostrar nombre del Bridge cuando esté disponible; mientras tanto, matrícula
+        const char *nOcup = kaizen_getNombreOcupante();
+        if (nOcup[0] == '\0' && matriculaOcupante[0] != '\0') nOcup = matriculaOcupante;
+        ui.drawOcupado(kaizen_getNombre(), nOcup, timeStr);
         ui.drawBridgeIndicator(kaizen_isBridgeOK());
         return;
     }
+    if (kaizen_modoOcupacion()) {
+        ui.drawLibre(timeStr, kaizen_getNombre());
+        ui.drawBridgeIndicator(kaizen_isBridgeOK());
+        return;
+    }
+
+    ui.drawIdle(timeStr, kaizen_getNombre());
+    ui.drawBridgeIndicator(kaizen_isBridgeOK());
+}
+
+// Refresco periódico del reloj según la pantalla activa (actualización parcial)
+void ActualizarReloj() {
     DateTime ahora = rtc.getDateTime();
     char timeStr[8];
-    char dateStr[20];
     rtc.formatTime(ahora, timeStr, sizeof(timeStr));
-    rtc.formatDate(ahora, dateStr, sizeof(dateStr));
-
-    if (ui.getState() == UI_STATE_IDLE) {
-        ui.updateIdleTime(timeStr, dateStr);
-    } else {
-        ui.drawIdle(timeStr, dateStr);
+    switch (ui.getState()) {
+        case UI_STATE_IDLE:
+            ui.updateIdleTime(timeStr);
+            break;
+        case UI_STATE_LIBRE:   ui.updateLibreTime(timeStr);   break;
+        case UI_STATE_OCUPADO: ui.updateOcupadoTime(timeStr); break;
+        default: break;
     }
-    ui.drawBridgeIndicator(kaizen_isBridgeOK());
 }

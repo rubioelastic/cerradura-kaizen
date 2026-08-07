@@ -9,16 +9,27 @@
 //     flags(1)      bit0=1 → acceso libre; bit0=0 → whitelist
 //                   bit1=1 → apertura remota inmediata (10 s)
 //                   bit2=1 → modo ocupación; bit2=0 → modo apertura
+//                   bit3=1 → forzar OCUPACION de la sala
+//                   bit4=1 → forzar LIBERACION de la sala
+//                   (bit3 y bit4 simultáneos = inválido, se ignoran)
 //     n_mats(1)     número de matrículas en whitelist
 //     mats(n×8)     matrículas autorizadas (8 chars cada una)
 //     len_nombre(1) longitud del nombre del espacio
 //     nombre(N)     nombre del espacio (sin null terminator)
+//     mat_ocup(8)   SOLO si bit3=1: matrícula del nuevo ocupante (8 chars)
 //
 //   Cerradura → Bridge (K_OK data):
+//     status(1)       bit0=1 → nombre del ocupante pendiente de recibir
 //     n_fichajes(1)   máx KAIZEN_MAX_FICHAJES_RESP
 //     fichajes(N×14)  matricula(8) + epoch(4LE) + autorizado(1) + tipo(1)
 //                     tipo: 0=acceso, 1=ocupar, 2=liberar
 //     Buffer NVS se borra solo tras confirmar el envío.
+//
+// PROTOCOLO KAIZEN_NOMBRE_OCUPANTE (0x00B1):
+//   Bridge → Cerradura (data):
+//     len_nombre(1) longitud del nombre de la persona
+//     nombre(N)     nombre del ocupante (sin null terminator)
+//   Cerradura → Bridge: K_OK sin datos
 // ============================================================
 
 #include <Arduino.h>
@@ -26,7 +37,9 @@
 // ─────────────────────────────────────────────────────────────
 // Comandos
 // ─────────────────────────────────────────────────────────────
-#define KAIZEN_COMPLETO   0x00B0  // Mensaje único cíclico Bridge↔Cerradura
+#define KAIZEN_COMPLETO         0x00B0  // Mensaje único cíclico Bridge↔Cerradura
+#define KAIZEN_NOMBRE_OCUPANTE  0x00B1  // Bridge envía nombre del ocupante actual
+#define KAIZEN_SET_TIME         0x00B2  // Bridge envía hora local como epoch(4LE)
 
 #define K_OK              0xFFFE
 #define K_DISCONNECT      0xFFFB
@@ -74,7 +87,7 @@ struct KaizenMsg {
 #define KAIZEN_MAX_WHITELIST      200   // Máx matrículas en whitelist
 #define KAIZEN_FICHAJE_SIZE       14    // Bytes en wire: mat(8)+epoch(4LE)+aut(1)+tipo(1)
 #define KAIZEN_TIMEOUT_BRIDGE_MS  120000UL
-#define KAIZEN_FIRMWARE_VERSION   2
+#define KAIZEN_FIRMWARE_VERSION   1
 #define KAIZEN_TIMEOUT_SEND_MS    2000
 
 // ============================================================
@@ -105,10 +118,33 @@ bool         kaizen_modoOcupacion();
 // true si el Bridge solicitó apertura remota (se limpia al leer)
 bool         kaizen_hayAperturaRemota();
 
+// Consume-on-read: true UNA sola vez si el Bridge solicitó forzar OCUPACION
+bool         kaizen_consumirForzarOcupar();
+
+// Consume-on-read: true UNA sola vez si el Bridge solicitó forzar LIBERACION
+bool         kaizen_consumirForzarLiberar();
+
+// Matrícula del ocupante recibida con el último forzar OCUPAR del Bridge (8 chars + '\0')
+const char*  kaizen_getMatriculaForzada();
+
 // true si la matrícula (8 chars) está en la whitelist
 bool         kaizen_estaAutorizado(const char *matricula);
 
+// ── Ocupante ─────────────────────────────────────────────────
+// Activa o desactiva el flag «nombre de ocupante pendiente» de recibir.
+// Al desactivar, borra también el nombre almacenado.
+void         kaizen_marcarOcupantePendiente(bool pendiente);
+
+// true mientras no se ha recibido aún el nombre del ocupante actual
+bool         kaizen_ocupantePendiente();
+
+// Nombre del ocupante enviado por el Bridge (cadena vacía si no disponible)
+const char*  kaizen_getNombreOcupante();
+
 // ── Fichajes ─────────────────────────────────────────────────
 // Encola un fichaje en el buffer NVS; se enviará en el próximo KAIZEN_COMPLETO
-void         kaizen_registrarFichaje(const char *matricula, bool autorizado,
-                                     uint32_t epoch, uint8_t tipo);
+void         kaizen_registrarFichaje(const char *matricula, bool autorizado, uint32_t epoch, uint8_t tipo);
+
+// ── Sincronización de hora ──────────────────────────────────
+// Consume-on-read: devuelve true y rellena *epoch si el Bridge envió nueva hora
+bool         kaizen_consumirHoraPendiente(uint32_t *epoch);

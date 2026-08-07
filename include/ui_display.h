@@ -35,6 +35,31 @@
 #define COL_CYAN        0x07FF  // Cian → información
 
 // ─────────────────────────────────────────────────────────────
+// Layout de las pantallas LIBRE / OCUPADO
+//   Todas las coordenadas en píxeles; pantalla circular 240×240 px
+// ─────────────────────────────────────────────────────────────
+// ── Cabecera (icono + etiqueta LIBRE/OCUPADO + separador)
+#define LO_LOCK_X        75    // X centro icono candado
+#define LO_LOCK_Y        28    // Y base icono candado
+#define LO_LABEL_X       100   // X texto estado (datum ML_DATUM)
+#define LO_LABEL_Y       48    // Y texto estado
+#define LO_SEP_X0        40    // X inicio línea separadora
+#define LO_SEP_X1        200   // X fin línea separadora
+#define LO_SEP_Y         62    // Y línea separadora
+// ── Zona central (nombres)
+#define LO_SALA_Y        78    // Y inicio nombre de sala
+#define LO_NAMES_SIZE    2     // Tamaño de fuente para nombres
+#define LO_NAMES_WRAP    190   // Ancho máximo antes de saltar de línea (px)
+#define LO_LINE_H        22    // Alto de línea para LO_NAMES_SIZE (size*8+6)
+#define LO_NAMES_GAP     6     // Separación vertical entre sala y persona (px)
+// ── Separador encima del reloj
+#define LO_SEP2_Y        188   // Y segunda línea separadora (encima del reloj)
+// ── Reloj (parte inferior)
+#define LO_CLOCK_Y       210   // Y centro del texto del reloj
+#define LO_CLOCK_BG_Y    198   // Y inicio área de borrado del reloj
+#define LO_CLOCK_BG_H    24    // Alto área de borrado del reloj
+
+// ─────────────────────────────────────────────────────────────
 // Definición de estados de la UI
 // ─────────────────────────────────────────────────────────────
 typedef enum {
@@ -46,7 +71,8 @@ typedef enum {
     UI_STATE_REMOVE_ALL  = 5,  // Modo: eliminar todas las matrículas
     UI_STATE_ERROR       = 6,  // Error de sistema
     UI_STATE_LIBRE       = 7,  // Espacio LIBRE (Bridge conectado)
-    UI_STATE_OCUPADO     = 8   // Espacio OCUPADO (Bridge conectado)
+    UI_STATE_OCUPADO     = 8,  // Espacio OCUPADO (Bridge conectado)
+    UI_STATE_ABIERTA     = 9
 } UIState;
 
 // ─────────────────────────────────────────────────────────────
@@ -67,8 +93,7 @@ public:
         _disp.setBrightness(180);       // Brillo moderado (0–255)
         _disp.fillScreen(COL_BG_BLACK); // Fondo negro inicial
         drawSplash();                   // Pantalla de bienvenida
-        delay(2000);
-        drawIdle("--:--", "-- / -- / ----"); // Estado inicial sin hora
+        delay(5000);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -81,32 +106,30 @@ public:
     //   timeStr — cadena de hora "HH:MM"
     //   dateStr — cadena de fecha "DD / MM / AAAA"
     // ─────────────────────────────────────────────────────────
-    void drawIdle(const char *timeStr, const char *dateStr) {
+    void drawIdle(const char *timeStr, const char *nombre = nullptr) {
         _currentState = UI_STATE_IDLE;
         _disp.fillScreen(COL_BG_BLACK);
 
-        // ── Círculo decorativo exterior
-        _disp.drawCircle(120, 120, 115, COL_GRAY);
-        _disp.drawCircle(120, 120, 113, COL_BG_DARK);
+        // Círculo decorativo exterior azul
+        _disp.drawCircle(120, 120, 119, COL_CYAN);
+        _disp.drawCircle(120, 120, 118, 0x000F);
 
-        // ── Icono de candado simplificado (centro superior)
-        drawLockIcon(120, 62, COL_WHITE, true); // true = cerrado
+        // Cabecera: candado cerrado + "ACCESO"
+        drawHeaderEstado("ACCESO", COL_CYAN, true, COL_CYAN);
 
-        // ── Hora grande en el centro
-        _disp.setTextSize(3);
+        // Nombre del espacio (zona central)
+        if (nombre && nombre[0]) {
+            drawWrapped(nombre, 120, LO_SALA_Y, LO_NAMES_SIZE, COL_CYAN, LO_NAMES_WRAP);
+        }
+
+        // Separador encima del reloj
+        _disp.drawLine(LO_SEP_X0, LO_SEP2_Y, LO_SEP_X1, LO_SEP2_Y, COL_CYAN);
+
+        // Reloj inferior
+        _disp.setTextSize(2);
         _disp.setTextColor(COL_WHITE);
-        _disp.setTextDatum(MC_DATUM);            // Centrado horizontal y vertical
-        _disp.drawString(timeStr, 120, 120);
-
-        // ── Fecha pequeña debajo de la hora
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_GRAY);
-        _disp.drawString(dateStr, 120, 150);
-
-        // ── Instrucción al usuario
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_CYAN);
-        _disp.drawString("Acerca la tarjeta", 120, 185);
+        _disp.setTextDatum(MC_DATUM);
+        _disp.drawString(timeStr, 120, LO_CLOCK_Y);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -121,7 +144,7 @@ public:
         _disp.fillScreen(COL_BG_BLACK);
 
         // Círculo verde de fondo
-        _disp.fillCircle(120, 120, 112, 0x0320); // verde oscuro de fondo
+        _disp.fillCircle(120, 120, 117, 0x0320); // verde oscuro de fondo
 
         // Icono candado abierto
         drawLockIcon(120, 70, COL_GREEN, false); // false = abierto
@@ -154,7 +177,7 @@ public:
         _disp.fillScreen(COL_BG_BLACK);
 
         // Círculo rojo de fondo
-        _disp.fillCircle(120, 120, 112, 0x3000); // rojo muy oscuro
+        _disp.fillCircle(120, 120, 117, 0x3000); // rojo muy oscuro
 
         // Icono X (dos líneas diagonales)
         _disp.drawLine(90, 80, 150, 140, COL_RED);
@@ -189,8 +212,8 @@ public:
         _disp.fillScreen(COL_BG_BLACK);
 
         // Borde azul
-        _disp.drawCircle(120, 120, 115, COL_BLUE);
-        _disp.drawCircle(120, 120, 114, COL_BLUE);
+        _disp.drawCircle(120, 120, 119, COL_BLUE);
+        _disp.drawCircle(120, 120, 118, COL_BLUE);
 
         // Icono "+"
         _disp.fillRect(112, 80, 16, 80, COL_BLUE);  // vertical
@@ -220,8 +243,8 @@ public:
         _disp.fillScreen(COL_BG_BLACK);
 
         // Borde naranja
-        _disp.drawCircle(120, 120, 115, COL_ORANGE);
-        _disp.drawCircle(120, 120, 114, COL_ORANGE);
+        _disp.drawCircle(120, 120, 119, COL_ORANGE);
+        _disp.drawCircle(120, 120, 118, COL_ORANGE);
 
         // Icono "-"
         _disp.fillRect(80, 112, 80, 16, COL_ORANGE);
@@ -250,8 +273,8 @@ public:
         _disp.fillScreen(COL_BG_BLACK);
 
         // Círculo rojo de advertencia
-        _disp.drawCircle(120, 120, 115, COL_RED);
-        _disp.drawCircle(120, 120, 114, COL_RED);
+        _disp.drawCircle(120, 120, 119, COL_RED);
+        _disp.drawCircle(120, 120, 118, COL_RED);
 
         // Icono de papelera (simplificado)
         _disp.fillRect(100, 85,  40, 5,  COL_RED); // tapa
@@ -301,23 +324,13 @@ public:
     // Actualiza SOLO la hora y la fecha en la pantalla Idle
     // (sin redibujar toda la pantalla para evitar parpadeos)
     // ─────────────────────────────────────────────────────────
-    void updateIdleTime(const char *timeStr, const char *dateStr) {
+    void updateIdleTime(const char *timeStr) {
         if (_currentState != UI_STATE_IDLE) return;
-
-        // Borra el área de hora anterior con fondo negro
-        _disp.fillRect(40, 103, 160, 35, COL_BG_BLACK);
-        _disp.fillRect(40, 140, 160, 18, COL_BG_BLACK);
-
-        // Redibuja hora
-        _disp.setTextSize(3);
+        _disp.fillRect(60, LO_CLOCK_BG_Y, 120, LO_CLOCK_BG_H, COL_BG_BLACK);
+        _disp.setTextSize(2);
         _disp.setTextColor(COL_WHITE);
         _disp.setTextDatum(MC_DATUM);
-        _disp.drawString(timeStr, 120, 120);
-
-        // Redibuja fecha
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_GRAY);
-        _disp.drawString(dateStr, 120, 150);
+        _disp.drawString(timeStr, 120, LO_CLOCK_Y);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -326,11 +339,11 @@ public:
     // ─────────────────────────────────────────────────────────
     void drawReadingCard(const char *matricula) {
         if (_currentState != UI_STATE_IDLE) return;
-        _disp.fillRect(40, 175, 160, 20, COL_BG_BLACK); // Borra línea anterior
+        _disp.fillRect(40, 145, 160, 20, COL_BG_BLACK); // Borra línea anterior
         _disp.setTextSize(1);
         _disp.setTextColor(COL_CYAN);
         _disp.setTextDatum(MC_DATUM);
-        _disp.drawString(matricula, 120, 185);
+        _disp.drawString(matricula, 120, 155);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -344,8 +357,8 @@ public:
         _currentState = UI_STATE_OCUPADO; // reutiliza el estado
         if (fullDraw) {
             _disp.fillScreen(0x2800); // naranja muy oscuro
-            _disp.drawCircle(120, 120, 115, COL_ORANGE);
-            _disp.drawCircle(120, 120, 113, COL_ORANGE);
+            _disp.drawCircle(120, 120, 119, COL_ORANGE);
+            _disp.drawCircle(120, 120, 118, COL_ORANGE);
 
             // Icono candado entreabierto
             drawLockIcon(120, 50, COL_ORANGE, false);
@@ -382,8 +395,8 @@ public:
         if (fullDraw) {
             _currentState = UI_STATE_OCUPADO;
             _disp.fillScreen(0x2800);
-            _disp.drawCircle(120, 120, 115, COL_ORANGE);
-            _disp.drawCircle(120, 120, 113, COL_ORANGE);
+            _disp.drawCircle(120, 120, 119, COL_ORANGE);
+            _disp.drawCircle(120, 120, 118, COL_ORANGE);
             drawLockIcon(120, 50, COL_ORANGE, false);
             _disp.setTextSize(1);
             _disp.setTextColor(COL_WHITE);
@@ -403,55 +416,114 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────
-    // Pantalla ESPACIO LIBRE (Bridge conectado)
-    //   Fondo verde oscuro, candado abierto, texto grande "LIBRE",
-    //   nombre del espacio, reloj.
-    // ─────────────────────────────────────────────────────────
-    void drawLibre(const char *timeStr, const char *dateStr, const char *nombre) {
-        _currentState = UI_STATE_LIBRE;
-        // Fondo verde muy oscuro
-        _disp.fillScreen(0x0240);
-
-        // Círculo decorativo
-        _disp.drawCircle(120, 120, 115, COL_GREEN);
-        _disp.drawCircle(120, 120, 113, 0x0320);
-
-        // Candado abierto en verde
-        drawLockIcon(120, 48, COL_GREEN, false);
-
-        // Texto LIBRE grande
-        _disp.setTextSize(3);
+    // Pantalla PUERTA ABIERTA — se muestra mientras el relé está activo.
+    //   Fondo verde oscuro, candado abierto, texto "ABIERTA".
+    // ─────────────────────────────────────────────────────────────
+    void drawAbierta(const char *texto = "ABIERTA") {
+        _currentState = UI_STATE_ABIERTA;
+        _disp.fillScreen(COL_BG_BLACK);
+        _disp.fillCircle(120, 120, 118, 0x0320);         // verde oscuro
+        _disp.drawCircle(120, 120, 119, COL_GREEN);
+        _disp.drawCircle(120, 120, 118, COL_GREEN);
+        drawLockIcon(120, 65, COL_GREEN, false);          // candado abierto
+        _disp.setTextSize(2);
         _disp.setTextColor(COL_GREEN);
         _disp.setTextDatum(MC_DATUM);
-        _disp.drawString("LIBRE", 120, 108);
-
-        // Hora
-        _disp.setTextSize(2);
-        _disp.setTextColor(COL_WHITE);
-        _disp.drawString(timeStr, 120, 145);
-
-        // Fecha
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_GRAY);
-        _disp.drawString(dateStr, 120, 168);
-
-        // Nombre del espacio
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_CYAN);
-        _disp.drawString(nombre, 120, 193);
+        _disp.drawString(texto, 120, 165);
     }
 
-    // Actualiza solo hora/fecha en pantalla LIBRE (sin redibujar todo)
-    void updateLibreTime(const char *timeStr, const char *dateStr) {
-        if (_currentState != UI_STATE_LIBRE) return;
-        _disp.fillRect(40, 132, 160, 45, 0x0240);
+    // ─────────────────────────────────────────────────────────
+    // drawHeaderEstado — cabecera horizontal común a LIBRE/OCUPADO:
+    //   icono de candado a la izquierda + palabra de estado a su
+    //   derecha, y una línea separadora debajo. Libera espacio
+    //   inferior para mostrar los nombres en grande.
+    // ─────────────────────────────────────────────────────────
+    void drawHeaderEstado(const char *estado, uint16_t color, bool candadoCerrado, uint16_t sepColor) {
+        drawLockIcon(LO_LOCK_X, LO_LOCK_Y, color, candadoCerrado);
+        // Versión de firmware a la izquierda del candado
+        char verBuf[8];
+        snprintf(verBuf, sizeof(verBuf), "v%u", _fwVersion);
+        _disp.setTextSize(1);
+        _disp.setTextColor(COL_GRAY);
+        _disp.setTextDatum(MC_DATUM);
+        _disp.drawString(verBuf, 195, 55);
+        _disp.setTextSize(2);
+        _disp.setTextColor(color);
+        _disp.setTextDatum(ML_DATUM);
+        _disp.drawString(estado, LO_LABEL_X, LO_LABEL_Y);
+        _disp.drawLine(LO_SEP_X0, LO_SEP_Y, LO_SEP_X1, LO_SEP_Y, sepColor);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // drawWrapped — dibuja texto centrado con ajuste por palabras.
+    //   Si una palabra/línea no cabe en maxWidth, salta de línea.
+    //   Devuelve el número de líneas dibujadas.
+    // ─────────────────────────────────────────────────────────
+    int drawWrapped(const char *text, int cx, int topY, uint8_t size, uint16_t color, int maxWidth) {
+        _disp.setTextSize(size);
+        _disp.setTextColor(color);
+        _disp.setTextDatum(TC_DATUM);
+        const int lineH = size * 8 + 6;
+
+        char buf[64];
+        strncpy(buf, text, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+
+        char linea[64] = "";
+        int y = topY;
+        int nLineas = 0;
+
+        char *palabra = strtok(buf, " ");
+        while (palabra) {
+            char prueba[64];
+            if (linea[0]) snprintf(prueba, sizeof(prueba), "%s %s", linea, palabra);
+            else          snprintf(prueba, sizeof(prueba), "%s", palabra);
+
+            if (linea[0] == '\0' || _disp.textWidth(prueba) <= maxWidth) {
+                strncpy(linea, prueba, sizeof(linea) - 1);
+                linea[sizeof(linea) - 1] = '\0';
+            } else {
+                _disp.drawString(linea, cx, y);
+                y += lineH; nLineas++;
+                strncpy(linea, palabra, sizeof(linea) - 1);
+                linea[sizeof(linea) - 1] = '\0';
+            }
+            palabra = strtok(NULL, " ");
+        }
+        if (linea[0]) { _disp.drawString(linea, cx, y); nLineas++; }
+        return nLineas;
+    }
+
+    void drawLibre(const char *timeStr, const char *nombre) {
+        _currentState = UI_STATE_LIBRE;
+        _disp.fillScreen(0x0240);
+        _disp.drawCircle(120, 120, 119, COL_GREEN);
+        _disp.drawCircle(120, 120, 118, 0x0320);
+
+        // Cabecera: candado abierto + "LIBRE"
+        drawHeaderEstado("LIBRE", COL_GREEN, false, 0x0320);
+
+        // Nombres (zona central)
+        drawWrapped(nombre, 120, LO_SALA_Y, LO_NAMES_SIZE, COL_CYAN, LO_NAMES_WRAP);
+
+        // Separador encima del reloj
+        _disp.drawLine(LO_SEP_X0, LO_SEP2_Y, LO_SEP_X1, LO_SEP2_Y, 0x0320);
+
+        // Reloj inferior
         _disp.setTextSize(2);
         _disp.setTextColor(COL_WHITE);
         _disp.setTextDatum(MC_DATUM);
-        _disp.drawString(timeStr, 120, 145);
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_GRAY);
-        _disp.drawString(dateStr, 120, 168);
+        _disp.drawString(timeStr, 120, LO_CLOCK_Y);
+    }
+
+    // Actualiza solo la hora en pantalla LIBRE (sin redibujar todo)
+    void updateLibreTime(const char *timeStr) {
+        if (_currentState != UI_STATE_LIBRE) return;
+        _disp.fillRect(60, LO_CLOCK_BG_Y, 120, LO_CLOCK_BG_H, 0x0240);
+        _disp.setTextSize(2);
+        _disp.setTextColor(COL_WHITE);
+        _disp.setTextDatum(MC_DATUM);
+        _disp.drawString(timeStr, 120, LO_CLOCK_Y);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -459,36 +531,49 @@ public:
     //   Fondo rojo oscuro, candado cerrado, texto grande "OCUPADO",
     //   nombre del espacio (no se muestra quién está por privacidad).
     // ─────────────────────────────────────────────────────────
-    void drawOcupado(const char *nombre) {
+    void drawOcupado(const char *nombre, const char *nombreOcupante = nullptr, const char *timeStr = nullptr) {
         _currentState = UI_STATE_OCUPADO;
-        // Fondo rojo muy oscuro
         _disp.fillScreen(0x2000);
+        _disp.drawCircle(120, 120, 119, COL_RED);
+        _disp.drawCircle(120, 120, 118, COL_RED);
 
-        // Círculo decorativo
-        _disp.drawCircle(120, 120, 115, COL_RED);
-        _disp.drawCircle(120, 120, 113, 0x3000);
+        // Cabecera: candado cerrado + "OCUPADO"
+        drawHeaderEstado("OCUPADO", COL_RED, true, 0x4000);
 
-        // Candado cerrado en rojo
-        drawLockIcon(120, 55, COL_RED, true);
+        // Nombre de sala (zona central)
+        int lineasSala = drawWrapped(nombre, 120, LO_SALA_Y, LO_NAMES_SIZE, COL_CYAN, LO_NAMES_WRAP);
 
-        // Texto OCUPADO grande
+        // Nombre del ocupante debajo del nombre de sala
+        int yOcupante = LO_SALA_Y + lineasSala * LO_LINE_H + LO_NAMES_GAP;
+        if (nombreOcupante && nombreOcupante[0] != '\0') {
+            drawWrapped(nombreOcupante, 120, yOcupante, LO_NAMES_SIZE, COL_WHITE, LO_NAMES_WRAP);
+        } else {
+            _disp.setTextSize(LO_NAMES_SIZE);
+            _disp.setTextColor(0x7BEF);
+            _disp.setTextDatum(TC_DATUM);
+            _disp.drawString("Espacio en uso", 120, yOcupante);
+        }
+
+        // Separador encima del reloj
+        _disp.drawLine(LO_SEP_X0, LO_SEP2_Y, LO_SEP_X1, LO_SEP2_Y, 0x4000);
+
+        // Reloj inferior
+        if (timeStr && timeStr[0]) {
+            _disp.setTextSize(2);
+            _disp.setTextColor(COL_WHITE);
+            _disp.setTextDatum(MC_DATUM);
+            _disp.drawString(timeStr, 120, LO_CLOCK_Y);
+        }
+    }
+
+    // Actualiza solo la hora en pantalla OCUPADO (sin redibujar todo)
+    void updateOcupadoTime(const char *timeStr) {
+        if (_currentState != UI_STATE_OCUPADO) return;
+        _disp.fillRect(60, LO_CLOCK_BG_Y, 120, LO_CLOCK_BG_H, 0x2000);
         _disp.setTextSize(2);
-        _disp.setTextColor(COL_RED);
+        _disp.setTextColor(COL_WHITE);
         _disp.setTextDatum(MC_DATUM);
-        _disp.drawString("OCUPADO", 120, 118);
-
-        // Línea separadora
-        _disp.drawLine(60, 140, 180, 140, 0x4000);
-
-        // Nombre del espacio
-        _disp.setTextSize(1);
-        _disp.setTextColor(COL_GRAY);
-        _disp.drawString(nombre, 120, 158);
-
-        // Instrucción: solo el Bridge puede liberar
-        _disp.setTextColor(0x7BEF);
-        _disp.drawString("Espacio en uso", 120, 182);
-        _disp.drawString("Acerca tarjeta para entrar", 120, 200);
+        _disp.drawString(timeStr, 120, LO_CLOCK_Y);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -509,8 +594,9 @@ public:
 
         // Limpiar área previa con el color de fondo correspondiente al estado
         uint16_t bg = COL_BG_BLACK;
-        if (_currentState == UI_STATE_LIBRE)   bg = 0x0240; // verde oscuro
-        if (_currentState == UI_STATE_OCUPADO) bg = 0x2000; // rojo oscuro
+        if (_currentState == UI_STATE_LIBRE)    bg = 0x0240; // verde oscuro
+        if (_currentState == UI_STATE_OCUPADO)  bg = 0x2000; // rojo oscuro
+        if (_currentState == UI_STATE_ABIERTA)  bg = 0x0320; // verde oscuro (fill de drawAbierta)
         _disp.fillRect(cx - r - 3, cy - r - 3, (r + 3) * 2, (r + 3) * 2, bg);
 
         // Punto principal: verde=conectado, gris=sin Bridge
@@ -526,16 +612,19 @@ public:
     // ─────────────────────────────────────────────────────────
     UIState getState() const { return _currentState; }
 
+    void setFwVersion(uint8_t v) { _fwVersion = v; }
+
 private:
-    M5GFX  &_disp;         // Referencia al objeto de pantalla del M5Dial
-    UIState _currentState; // Estado visual actual
+    M5GFX   &_disp;         // Referencia al objeto de pantalla del M5Dial
+    UIState  _currentState; // Estado visual actual
+    uint8_t  _fwVersion = 0; // Versión de firmware (se muestra en cabecera)
 
     // ─────────────────────────────────────────────────────────
     // Dibuja la pantalla de splash inicial (bienvenida)
     // ─────────────────────────────────────────────────────────
     void drawSplash() {
         _disp.fillScreen(COL_BG_BLACK);
-        _disp.drawCircle(120, 120, 115, COL_CYAN);
+        _disp.drawCircle(120, 120, 119, COL_CYAN);
         _disp.setTextSize(2);
         _disp.setTextColor(COL_CYAN);
         _disp.setTextDatum(MC_DATUM);
@@ -545,8 +634,8 @@ private:
         _disp.setTextColor(COL_GRAY);
         _disp.drawString("Sistema RFID de Acceso", 120, 148);
         _disp.drawString("Adaptativo", 120, 162);
-        _disp.setTextColor(COL_WHITE);
-        _disp.drawString("M5Dial v1.0", 120, 190);
+        String macAddr = WiFi.macAddress();
+        _disp.drawString(macAddr, 120, 190);
     }
 
     // ─────────────────────────────────────────────────────────

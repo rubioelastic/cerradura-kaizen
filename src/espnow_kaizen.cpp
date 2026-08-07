@@ -26,6 +26,17 @@ static uint8_t _kNWhitelist   = 0;
 static bool    _kAccesoLibre    = false;
 static bool    _kAperturaRemota = false;
 static bool    _kModoOcupacion  = false;
+static bool    _kForzarOcupar   = false;
+static bool    _kForzarLiberar  = false;
+static char    _kForzarMatricula[9] = "";  // Matrícula enviada junto al forzar OCUPAR
+
+// ── Sincronización de hora
+static bool     _kHoraPendiente  = false;
+static uint32_t _kEpochPendiente = 0;
+
+// ── Nombre del ocupante actual
+static bool _kNombreOcupantePendiente = false;
+static char _kNombreOcupante[32]      = "";
 
 // ── Buffer de fichajes pendientes (respaldado en NVS)
 static KaizenFichaje _kFichajes[KAIZEN_MAX_FICHAJES];
@@ -74,8 +85,7 @@ static void _kLoadWhitelist() {
     strncpy(_kNombre, n.c_str(), 31);
     _kNombre[31] = '\0';
     _kPrefs.end();
-    Serial.printf("[NVS] Whitelist: %u mats, libre=%d, nombre='%s'\n",
-                  _kNWhitelist, (int)_kAccesoLibre, _kNombre);
+    Serial.printf("[NVS] Whitelist: %u mats, libre=%d, nombre='%s'\n", _kNWhitelist, (int)_kAccesoLibre, _kNombre);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -85,8 +95,7 @@ static void _kSaveFichajes() {
     _kPrefs.begin("kaizen", false);
     _kPrefs.putUChar("fcnt", _kNFichajes);
     if (_kNFichajes > 0) {
-        _kPrefs.putBytes("fdata", _kFichajes,
-                         _kNFichajes * sizeof(KaizenFichaje));
+        _kPrefs.putBytes("fdata", _kFichajes, _kNFichajes * sizeof(KaizenFichaje));
     }
     _kPrefs.end();
 }
@@ -96,8 +105,7 @@ static void _kLoadFichajes() {
     _kNFichajes = _kPrefs.getUChar("fcnt", 0);
     if (_kNFichajes > KAIZEN_MAX_FICHAJES) _kNFichajes = KAIZEN_MAX_FICHAJES;
     if (_kNFichajes > 0) {
-        _kPrefs.getBytes("fdata", _kFichajes,
-                         _kNFichajes * sizeof(KaizenFichaje));
+        _kPrefs.getBytes("fdata", _kFichajes, _kNFichajes * sizeof(KaizenFichaje));
     }
     _kPrefs.end();
     Serial.printf("[NVS] Fichajes pendientes: %u\n", _kNFichajes);
@@ -221,8 +229,7 @@ static void _kProcesar() {
         if (_kSeqEsperada == 0) _kSeqEsperada++;
     }
 
-    Serial.printf("[ESPNOW] RX cmd=0x%04X seq=%u/%u len=%u\n",
-                  _kMsgIn.comando, _kMsgIn.seq, _kSeqEsperada, _kLenMsgIn);
+    Serial.printf("[ESPNOW] RX cmd=0x%04X seq=%u/%u len=%u\n", _kMsgIn.comando, _kMsgIn.seq, _kSeqEsperada, _kLenMsgIn);
 
     if (_kMsgIn.seq != _kSeqEsperada && _kMsgIn.seq != 0) {
         uint8_t seqPrev = _kSeqEsperada - 1;
@@ -243,8 +250,7 @@ static void _kProcesar() {
     // ── CRC
     uint8_t crcCalc = _kCalcCRC(_kMsgIn, _kLenMsgIn);
     if (_kMsgIn.crc != crcCalc) {
-        Serial.printf("[ESPNOW] BAD_CRC recibido=0x%02X calculado=0x%02X\n",
-                      _kMsgIn.crc, crcCalc);
+        Serial.printf("[ESPNOW] BAD_CRC recibido=0x%02X calculado=0x%02X\n", _kMsgIn.crc, crcCalc);
         _kResponder(K_BAD_CRC, _kSeqEsperada);
         return;
     }
@@ -279,6 +285,16 @@ static void _kProcesar() {
                 Serial.println("[BRIDGE] Apertura remota solicitada");
             }
             _kModoOcupacion = (flags & 0x04) != 0;
+            {
+                bool fOcupar  = (flags & 0x08) != 0;
+                bool fLiberar = (flags & 0x10) != 0;
+                if (fOcupar && fLiberar) {
+                    Serial.println("[BRIDGE] Forzado inválido: ocupa+libera simultáneo, ignorado");
+                } else {
+                    if (fOcupar)  { _kForzarOcupar  = true; Serial.println("[BRIDGE] Forzar OCUPACION"); }
+                    if (fLiberar) { _kForzarLiberar = true; Serial.println("[BRIDGE] Forzar LIBERACION"); }
+                }
+            }
 
             uint8_t nMats = _kMsgIn.data[1];
             if (nMats > KAIZEN_MAX_WHITELIST) nMats = KAIZEN_MAX_WHITELIST;
@@ -295,17 +311,29 @@ static void _kProcesar() {
             }
             _kNombre[lenNombre] = '\0';
 
+            // Matrícula del ocupante (solo presente cuando bit3=1 → forzar OCUPAR)
+            if (_kForzarOcupar) {
+                uint16_t matCursor = cursor + 1 + lenNombre;
+                if (matCursor + 8 <= (uint16_t)sizeof(_kMsgIn.data)) {
+                    memcpy(_kForzarMatricula, &_kMsgIn.data[matCursor], 8);
+                } else {
+                    memset(_kForzarMatricula, '0', 8);
+                }
+                _kForzarMatricula[8] = '\0';
+            }
+
             _kSaveWhitelist();
             _kEstadoCambio = true;
 
             Serial.printf("[BRIDGE] libre=%d mats=%u nombre='%s'\n",
                           (int)_kAccesoLibre, nMats, _kNombre);
 
-            // Respuesta: n_fichajes(1) + [mat(8)+epoch(4LE)+aut(1)]×n
+            // Respuesta: status(1) + n_fichajes(1) + [mat(8)+epoch(4LE)+aut(1)+tipo(1)]×n
             uint8_t nResp = (_kNFichajes < KAIZEN_MAX_FICHAJES_RESP)
                           ? _kNFichajes : KAIZEN_MAX_FICHAJES_RESP;
-            uint8_t buf[1 + KAIZEN_MAX_FICHAJES_RESP * KAIZEN_FICHAJE_SIZE];
+            uint8_t buf[2 + KAIZEN_MAX_FICHAJES_RESP * KAIZEN_FICHAJE_SIZE];
             uint16_t pos = 0;
+            buf[pos++] = _kNombreOcupantePendiente ? 0x01 : 0x00;  // status: bit0=nombre_ocupante_pendiente
             buf[pos++] = nResp;
             for (uint8_t i = 0; i < nResp; i++) {
                 memcpy(&buf[pos], _kFichajes[i].matricula, 8); pos += 8;
@@ -321,8 +349,7 @@ static void _kProcesar() {
                 if (nResp > 0) {
                     uint8_t remaining = _kNFichajes - nResp;
                     if (remaining > 0) {
-                        memmove(_kFichajes, _kFichajes + nResp,
-                                remaining * sizeof(KaizenFichaje));
+                        memmove(_kFichajes, _kFichajes + nResp, remaining * sizeof(KaizenFichaje));
                     }
                     _kNFichajes = remaining;
                     _kSaveFichajes();
@@ -410,6 +437,43 @@ static void _kProcesar() {
             break;
         }
 
+        case KAIZEN_NOMBRE_OCUPANTE: {
+            // payload: len_nombre(1) + nombre(N)
+            uint8_t lenDatos = _kLenMsgIn - 4;
+            if (lenDatos < 1) {
+                Serial.println("[BRIDGE] NOMBRE_OCUPANTE: payload demasiado corto");
+                _kResponder(K_NOTFOUND);
+                break;
+            }
+            uint8_t lenNombre = _kMsgIn.data[0];
+            if (lenNombre > 31) lenNombre = 31;
+            if (lenNombre > 0 && (uint8_t)(1 + lenNombre) <= lenDatos) {
+                memcpy(_kNombreOcupante, &_kMsgIn.data[1], lenNombre);
+            }
+            _kNombreOcupante[lenNombre] = '\0';
+            _kNombreOcupantePendiente = false;
+            _kEstadoCambio = true;
+            Serial.printf("[BRIDGE] Nombre ocupante recibido: '%s'\n", _kNombreOcupante);
+            _kResponder(K_OK);
+            break;
+        }
+
+        case KAIZEN_SET_TIME: {
+            // payload: epoch(4 bytes, little-endian) — hora local
+            if (_kLenMsgIn - 4 < 4) {
+                _kResponder(K_NOTFOUND);
+                break;
+            }
+            _kEpochPendiente = (uint32_t)_kMsgIn.data[0]
+                             | ((uint32_t)_kMsgIn.data[1] << 8)
+                             | ((uint32_t)_kMsgIn.data[2] << 16)
+                             | ((uint32_t)_kMsgIn.data[3] << 24);
+            _kHoraPendiente = true;
+            Serial.printf("[BRIDGE] Hora recibida: epoch=%u\n", _kEpochPendiente);
+            _kResponder(K_OK);
+            break;
+        }
+
         default:
             _kResponder(K_NOTFOUND);
             break;
@@ -465,6 +529,42 @@ bool kaizen_hayAperturaRemota() {
     return v;
 }
 
+bool kaizen_consumirForzarOcupar() {
+    bool v = _kForzarOcupar;
+    _kForzarOcupar = false;
+    return v;
+}
+
+bool kaizen_consumirForzarLiberar() {
+    bool v = _kForzarLiberar;
+    _kForzarLiberar = false;
+    return v;
+}
+
+const char* kaizen_getMatriculaForzada() {
+    return _kForzarMatricula;
+}
+
+bool kaizen_consumirHoraPendiente(uint32_t *epoch) {
+    if (!_kHoraPendiente) return false;
+    *epoch = _kEpochPendiente;
+    _kHoraPendiente = false;
+    return true;
+}
+
+void kaizen_marcarOcupantePendiente(bool pendiente) {
+    _kNombreOcupantePendiente = pendiente;
+    if (!pendiente) _kNombreOcupante[0] = '\0';
+}
+
+bool kaizen_ocupantePendiente() {
+    return _kNombreOcupantePendiente;
+}
+
+const char* kaizen_getNombreOcupante() {
+    return _kNombreOcupante;
+}
+
 bool kaizen_estaAutorizado(const char *matricula) {
     for (uint8_t i = 0; i < _kNWhitelist; i++) {
         if (memcmp(_kWhitelist[i], matricula, 8) == 0) return true;
@@ -472,12 +572,10 @@ bool kaizen_estaAutorizado(const char *matricula) {
     return false;
 }
 
-void kaizen_registrarFichaje(const char *matricula, bool autorizado,
-                             uint32_t epoch, uint8_t tipo) {
+void kaizen_registrarFichaje(const char *matricula, bool autorizado, uint32_t epoch, uint8_t tipo) {
     if (_kNFichajes >= KAIZEN_MAX_FICHAJES) {
         // Buffer lleno: descartar el más antiguo
-        memmove(_kFichajes, _kFichajes + 1,
-                (KAIZEN_MAX_FICHAJES - 1) * sizeof(KaizenFichaje));
+        memmove(_kFichajes, _kFichajes + 1, (KAIZEN_MAX_FICHAJES - 1) * sizeof(KaizenFichaje));
         _kNFichajes = KAIZEN_MAX_FICHAJES - 1;
     }
     memcpy(_kFichajes[_kNFichajes].matricula, matricula, 8);
@@ -486,8 +584,7 @@ void kaizen_registrarFichaje(const char *matricula, bool autorizado,
     _kFichajes[_kNFichajes].tipo       = tipo;
     _kNFichajes++;
     _kSaveFichajes();
-    Serial.printf("[FICHAJE] %c%.8s epoch=%u tipo=%u\n",
-                  autorizado ? '+' : '-', matricula, epoch, tipo);
+    Serial.printf("[FICHAJE] %c%.8s epoch=%u tipo=%u\n", autorizado ? '+' : '-', matricula, epoch, tipo);
 }
 
 uint32_t kaizen_tiempoSinBridge() {
