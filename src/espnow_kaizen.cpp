@@ -242,7 +242,7 @@ static void _kProcesar() {
             while (!_kMsgEnviado && millis() < lim) vTaskDelay(5);
         } else {
             Serial.printf("[ESPNOW] BAD_SEQ recibida=%u esperada=%u\n", _kMsgIn.seq, _kSeqEsperada);
-            _kResponder(K_BAD_SECUENCE, _kSeqEsperada);
+            _kResponder(BAD_SECUENCE, _kSeqEsperada);
         }
         return;
     }
@@ -251,7 +251,7 @@ static void _kProcesar() {
     uint8_t crcCalc = _kCalcCRC(_kMsgIn, _kLenMsgIn);
     if (_kMsgIn.crc != crcCalc) {
         Serial.printf("[ESPNOW] BAD_CRC recibido=0x%02X calculado=0x%02X\n", _kMsgIn.crc, crcCalc);
-        _kResponder(K_BAD_CRC, _kSeqEsperada);
+        _kResponder(BAD_CRC, _kSeqEsperada);
         return;
     }
 
@@ -264,19 +264,19 @@ static void _kProcesar() {
     // ── Dispatch de comandos
     switch (_kMsgIn.comando) {
 
-        case K_ACK: {
+        case ACK: {
             // Primer ACK: responder DISCONNECT para resetear secuencias
             if (_kPrimerACK) {
-                _kResponder(K_DISCONNECT);
+                _kResponder(DISCONNECT);
                 _kPrimerACK = false;
             } else {
-                _kResponder(K_OK);
+                _kResponder(OK);
             }
             break;
         }
 
 
-        case KAIZEN_COMPLETO: {
+        case MENSAJE_COMPLETO_ESPACIO: {
             // flags(1) + n_mats(1) + mats(n×8) + len_nombre(1) + nombre
             uint8_t flags = _kMsgIn.data[0];
             _kAccesoLibre   = (flags & 0x01) != 0;
@@ -345,7 +345,7 @@ static void _kProcesar() {
                 buf[pos++] = _kFichajes[i].tipo;
             }
 
-            if (_kResponder(K_OK, buf, (uint8_t)pos)) {
+            if (_kResponder(OK, buf, (uint8_t)pos)) {
                 if (nResp > 0) {
                     uint8_t remaining = _kNFichajes - nResp;
                     if (remaining > 0) {
@@ -360,17 +360,17 @@ static void _kProcesar() {
             break;
         }
 
-        case K_ASK_VERSION: {
+        case ASK_VERSION: {
             const uint32_t v = KAIZEN_FIRMWARE_VERSION;
             uint8_t b[4] = {
                 (uint8_t)(v >> 24), (uint8_t)(v >> 16),
                 (uint8_t)(v >> 8),  (uint8_t)v
             };
-            _kResponder(K_OK, b, 4);
+            _kResponder(OK, b, 4);
             break;
         }
 
-        case K_UPDATE: {
+        case UPDATE: {
             // Protocolo OTA idéntico al de ReactionTime:
             //   Primer paquete (8 bytes data): indice(4LE) + total(4LE)
             //   Paquetes siguientes:           indice(4LE) + chunk(N bytes)
@@ -386,7 +386,7 @@ static void _kProcesar() {
                 if (lenDatos != 8) { _kHardReset(); break; }
                 if (indiceRecibido != _kOtaProgress) {
                     // Bridge quiere reanudar desde otro offset — confirmar el nuestro
-                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                    _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                 } else if (indiceRecibido == 0) {
                     _kOtaTotal = ((uint32_t)_kMsgIn.data[7] << 24)
                                | ((uint32_t)_kMsgIn.data[6] << 16)
@@ -399,19 +399,19 @@ static void _kProcesar() {
                     }
                     _kOtaStarted = true;
                     Serial.printf("[OTA] Inicio. Total: %u bytes\n", _kOtaTotal);
-                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                    _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                 } else {
-                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                    _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                 }
             } else {
                 // Paquetes de datos
                 int chunkLen = (int)lenDatos - 4;  // quitar los 4 bytes de índice
                 if (indiceRecibido == 0 && lenDatos == 8) {
                     // Bridge reinicia desde 0 (reintento)
-                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                    _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                 } else if (indiceRecibido != _kOtaProgress) {
                     // Offset desfasado — indicar el nuestro
-                    _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                    _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                 } else {
                     if (Update.write(&_kMsgIn.data[4], chunkLen) != (size_t)chunkLen) {
                         Update.printError(Serial);
@@ -423,14 +423,14 @@ static void _kProcesar() {
                         Serial.println("[OTA] Completo. Reiniciando...");
                         _kOtaStarted = false;
                         if (Update.end()) {
-                            _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                            _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                             _kHardReset(); // reinicio inmediato con nuevo firmware
                         } else {
                             Update.printError(Serial);
                             _kHardReset();
                         }
                     } else {
-                        _kResponder(K_OK, (uint8_t *)&_kOtaProgress, 4);
+                        _kResponder(OK, (uint8_t *)&_kOtaProgress, 4);
                     }
                 }
             }
@@ -442,7 +442,7 @@ static void _kProcesar() {
             uint8_t lenDatos = _kLenMsgIn - 4;
             if (lenDatos < 1) {
                 Serial.println("[BRIDGE] NOMBRE_OCUPANTE: payload demasiado corto");
-                _kResponder(K_NOTFOUND);
+                _kResponder(NOTFOUND);
                 break;
             }
             uint8_t lenNombre = _kMsgIn.data[0];
@@ -454,14 +454,14 @@ static void _kProcesar() {
             _kNombreOcupantePendiente = false;
             _kEstadoCambio = true;
             Serial.printf("[BRIDGE] Nombre ocupante recibido: '%s'\n", _kNombreOcupante);
-            _kResponder(K_OK);
+            _kResponder(OK);
             break;
         }
 
         case KAIZEN_SET_TIME: {
             // payload: epoch(4 bytes, little-endian) — hora local
             if (_kLenMsgIn - 4 < 4) {
-                _kResponder(K_NOTFOUND);
+                _kResponder(NOTFOUND);
                 break;
             }
             _kEpochPendiente = (uint32_t)_kMsgIn.data[0]
@@ -470,12 +470,12 @@ static void _kProcesar() {
                              | ((uint32_t)_kMsgIn.data[3] << 24);
             _kHoraPendiente = true;
             Serial.printf("[BRIDGE] Hora recibida: epoch=%u\n", _kEpochPendiente);
-            _kResponder(K_OK);
+            _kResponder(OK);
             break;
         }
 
         default:
-            _kResponder(K_NOTFOUND);
+            _kResponder(NOTFOUND);
             break;
     }
 }

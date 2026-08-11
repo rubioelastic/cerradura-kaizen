@@ -27,7 +27,7 @@ CREATE TABLE espacios (
     VersionFirmwareEjecutada  INT            NOT NULL DEFAULT 1,        -- versión que corre actualmente el ESP
     VersionFirmwareRequerida  INT            NOT NULL DEFAULT 1,        -- versión mínima que exige el Bridge (OTA)
     Debug                     BIT            NOT NULL DEFAULT 0,        -- 1 = modo verbose activado por el Bridge
-    LifeSignal                DATETIME2(0)                   NULL,      -- último KAIZEN_SYNC / KAIZEN_COMPLETO recibido
+    LifeSignal                DATETIME2(0)                   NULL,      -- último KAIZEN_SYNC / MENSAJE_COMPLETO_ESPACIO recibido
     created_at                DATETIME2(0)   NOT NULL DEFAULT SYSUTCDATETIME(),
     MapaX                     FLOAT                          NULL,      -- coordenada X en el plano del edificio
     MapaY                     FLOAT                          NULL,      -- coordenada Y en el plano del edificio

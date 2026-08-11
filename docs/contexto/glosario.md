@@ -52,7 +52,7 @@
 | `KAIZEN_CONFIG` | `0x0C01` | Envío de nombre del espacio + lista de matrículas autorizadas. |
 | `KAIZEN_LIBERAR` | `0x0C02` | Fuerza estado LIBRE desde el Bridge. |
 | `KAIZEN_OCUPAR` | `0x0C03` | Fuerza estado OCUPADO desde el Bridge. |
-| `KAIZEN_COMPLETO` | `0x00B0` | Mensaje único cíclico que reemplaza SYNC+CONFIG+LIBERAR+OCUPAR. |
+| `MENSAJE_COMPLETO_ESPACIO` | `0x00B0` | Mensaje único cíclico que reemplaza SYNC+CONFIG+LIBERAR+OCUPAR. |
 | **Bridge** | — | Dispositivo externo que orquesta uno o varios M5Dial vía ESP-NOW. Identifica cada M5Dial por su MAC WiFi STA. |
 | **TRM** | — | TiempoRespuestaMantenimiento. Proyecto hermano cuyo protocolo reutiliza la Cerradura Kaizen. Referencia: `Doc_ini/ReactionTime/`. |
 | **RNA** | — | [PENDIENTE: definición exacta en el contexto del sistema padre] |

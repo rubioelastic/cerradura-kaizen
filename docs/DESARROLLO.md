@@ -118,21 +118,21 @@ Todo el módulo está en un único header-only para simplicidad. Si el proyecto 
 
 ```
 Bridge                              Cerradura
-  │── K_ACK ─────────────────────────► │
-  │◄── K_DISCONNECT ──────────────────  │  ← reset secuencias
+  │── ACK ─────────────────────────► │
+  │◄── DISCONNECT ──────────────────  │  ← reset secuencias
   │── KAIZEN_CONFIG + matrículas ────► │
-  │◄── K_OK ──────────────────────────  │  ← actualiza EEPROM + pantalla
+  │◄── OK ──────────────────────────  │  ← actualiza EEPROM + pantalla
   │── KAIZEN_SYNC ─────────────────► │
-  │◄── K_OK + estado + eventos ───────  │  ← vacía cola de eventos
+  │◄── OK + estado + eventos ───────  │  ← vacía cola de eventos
   │── KAIZEN_LIBERAR ───────────────► │
-  │◄── K_OK ──────────────────────────  │
+  │◄── OK ──────────────────────────  │
 ```
 
 ### Añadir un nuevo comando
 
 1. Definir valor en `#define KAIZEN_NUEVO 0x0C04`.
 2. Añadir `case KAIZEN_NUEVO:` en `_kProcesar()` dentro del `switch`.
-3. Llamar `_kResponder(K_OK)` o `_kResponder(K_OK, datos, len)`.
+3. Llamar `_kResponder(OK)` o `_kResponder(OK, datos, len)`.
 4. En el Bridge añadir el envío correspondiente.
 
 ### Cola de eventos desbordada

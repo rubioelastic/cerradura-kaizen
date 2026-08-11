@@ -3,7 +3,7 @@
 // espnow_kaizen.h — Comunicación ESP-NOW con el Bridge
 //                   para la Cerradura Kaizen (M5Dial)
 //
-// PROTOCOLO KAIZEN_COMPLETO:
+// PROTOCOLO MENSAJE_COMPLETO_ESPACIO:
 //
 //   Bridge → Cerradura (data):
 //     flags(1)      bit0=1 → acceso libre; bit0=0 → whitelist
@@ -18,7 +18,7 @@
 //     nombre(N)     nombre del espacio (sin null terminator)
 //     mat_ocup(8)   SOLO si bit3=1: matrícula del nuevo ocupante (8 chars)
 //
-//   Cerradura → Bridge (K_OK data):
+//   Cerradura → Bridge (OK data):
 //     status(1)       bit0=1 → nombre del ocupante pendiente de recibir
 //     n_fichajes(1)   máx KAIZEN_MAX_FICHAJES_RESP
 //     fichajes(N×14)  matricula(8) + epoch(4LE) + autorizado(1) + tipo(1)
@@ -29,7 +29,7 @@
 //   Bridge → Cerradura (data):
 //     len_nombre(1) longitud del nombre de la persona
 //     nombre(N)     nombre del ocupante (sin null terminator)
-//   Cerradura → Bridge: K_OK sin datos
+//   Cerradura → Bridge: OK sin datos
 // ============================================================
 
 #include <Arduino.h>
@@ -37,18 +37,18 @@
 // ─────────────────────────────────────────────────────────────
 // Comandos
 // ─────────────────────────────────────────────────────────────
-#define KAIZEN_COMPLETO         0x00B0  // Mensaje único cíclico Bridge↔Cerradura
+#define MENSAJE_COMPLETO_ESPACIO         0x00B0  // Mensaje único cíclico Bridge↔Cerradura
 #define KAIZEN_NOMBRE_OCUPANTE  0x00B1  // Bridge envía nombre del ocupante actual
 #define KAIZEN_SET_TIME         0x00B2  // Bridge envía hora local como epoch(4LE)
 
-#define K_OK              0xFFFE
-#define K_DISCONNECT      0xFFFB
-#define K_ACK             0xFFF8
-#define K_NOTFOUND        0xFFF6
-#define K_BAD_SECUENCE    0xFFF4
-#define K_BAD_CRC         0xFFF3
-#define K_ASK_VERSION     0xFFEE
-#define K_UPDATE          0xFFED
+#define OK              0xFFFE
+#define DISCONNECT      0xFFFB
+#define ACK             0xFFF8
+#define NOTFOUND        0xFFF6
+#define BAD_SECUENCE    0xFFF4
+#define BAD_CRC         0xFFF3
+#define ASK_VERSION     0xFFEE
+#define UPDATE          0xFFED
 
 // ─────────────────────────────────────────────────────────────
 // Tipo de evento de un fichaje
@@ -142,7 +142,7 @@ bool         kaizen_ocupantePendiente();
 const char*  kaizen_getNombreOcupante();
 
 // ── Fichajes ─────────────────────────────────────────────────
-// Encola un fichaje en el buffer NVS; se enviará en el próximo KAIZEN_COMPLETO
+// Encola un fichaje en el buffer NVS; se enviará en el próximo MENSAJE_COMPLETO_ESPACIO
 void         kaizen_registrarFichaje(const char *matricula, bool autorizado, uint32_t epoch, uint8_t tipo);
 
 // ── Sincronización de hora ──────────────────────────────────

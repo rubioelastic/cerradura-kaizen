@@ -49,8 +49,8 @@ Idéntica a TiempoRespuestaMantenimiento (TRM):
 
 ### 2.2 Handshake inicial
 
-1. Bridge envía `K_ACK` (0xFFF8) con cualquier SEQ.
-2. Cerradura responde `K_DISCONNECT` (0xFFFB) → resetea sus contadores de secuencia.
+1. Bridge envía `ACK` (0xFFF8) con cualquier SEQ.
+2. Cerradura responde `DISCONNECT` (0xFFFB) → resetea sus contadores de secuencia.
 3. A partir de ese momento, SEQ debe ser incremental.
 
 ### 2.3 Timeout
@@ -67,7 +67,7 @@ Polling periódico. El Bridge lo envía para obtener el estado actual y los even
 
 **DATA de envío**: ninguno (solo cabecera de 4 bytes).
 
-**DATA de respuesta** (`K_OK`):
+**DATA de respuesta** (`OK`):
 
 | Offset | Tamaño | Descripción |
 |---|---|---|
@@ -78,7 +78,7 @@ Polling periódico. El Bridge lo envía para obtener el estado actual y los even
 | 11 + (i·13) | 8 bytes | Matrícula del evento `i` |
 | 19 + (i·13) | 4 bytes | Timestamp del evento `i` (`millis()`, little-endian) |
 
-Una vez la cerradura recibe el `K_OK` de vuelta del Bridge, **vacía la cola de eventos**. Si el Bridge no confirma (envío fallido), los eventos se mantienen en cola hasta el siguiente SYNC.
+Una vez la cerradura recibe el `OK` de vuelta del Bridge, **vacía la cola de eventos**. Si el Bridge no confirma (envío fallido), los eventos se mantienen en cola hasta el siguiente SYNC.
 
 **Periodicidad recomendada**: cada 10–30 segundos.
 
@@ -102,7 +102,7 @@ Configura el nombre del espacio y la lista de matrículas autorizadas. La cerrad
 - `0` → solo acceso: la cerradura abre/deniega pero no gestiona el estado LIBRE/OCUPADO.
 - `1` → acceso + estado: la cerradura muestra LIBRE/OCUPADO en pantalla y registra quién ocupa el espacio.
 
-**DATA de respuesta**: `K_OK` sin datos.
+**DATA de respuesta**: `OK` sin datos.
 
 **Efecto en la cerradura**:
 1. Establece `_kModoEstado`.
@@ -118,7 +118,7 @@ Fuerza el estado del espacio a **LIBRE** desde la RNA (fin de ensayo, cancelaci�
 
 **DATA de envío**: ninguno.
 
-**DATA de respuesta**: `K_OK` sin datos.
+**DATA de respuesta**: `OK` sin datos.
 
 **Efecto**: limpia el ocupante, pone estado LIBRE, redibuja pantalla.
 
@@ -134,15 +134,15 @@ Fuerza el estado del espacio a **OCUPADO** desde la RNA (reserva anticipada, etc
 |---|---|---|
 | 0 | 8 bytes | Matrícula del ocupante (opcional; si se omite, ocupante queda vacío) |
 
-**DATA de respuesta**: `K_OK` sin datos.
+**DATA de respuesta**: `OK` sin datos.
 
 ---
 
-### 3.5 `K_ASK_VERSION` — 0xFFEE
+### 3.5 `ASK_VERSION` — 0xFFEE
 
 Solicita la versión de firmware.
 
-**DATA de respuesta** (`K_OK`): 4 bytes big-endian con `KAIZEN_FIRMWARE_VERSION` (actualmente `0x00000001`).
+**DATA de respuesta** (`OK`): 4 bytes big-endian con `KAIZEN_FIRMWARE_VERSION` (actualmente `0x00000001`).
 
 ---
 
@@ -241,7 +241,7 @@ Los siguientes valores son constantes en `main.cpp`. Para modificarlos hay que r
 | `TIEMPO_MODO_MS` | 3000 ms | Timeout de los modos de gestión |
 | `KAIZEN_TIMEOUT_BRIDGE_MS` | 120 000 ms | Tiempo sin mensaje antes de declarar Bridge perdido |
 | `KAIZEN_WIFI_CHANNEL` | 1 | Canal Wi-Fi ESP-NOW |
-| `KAIZEN_FIRMWARE_VERSION` | 1 | Versión que responde a `K_ASK_VERSION` |
+| `KAIZEN_FIRMWARE_VERSION` | 1 | Versión que responde a `ASK_VERSION` |
 
 ---
 
@@ -249,11 +249,11 @@ Los siguientes valores son constantes en `main.cpp`. Para modificarlos hay que r
 
 | CMD | Código | Significado |
 |---|---|---|
-| `K_OK` | 0xFFFE | Operación correcta |
-| `K_BAD_CRC` | 0xFFF3 | CRC de la trama no coincide |
-| `K_BAD_SECUENCE` | 0xFFF4 | Número de secuencia inesperado |
-| `K_DISCONNECT` | 0xFFFB | Reset de secuencias (respuesta al primer K_ACK) |
-| `K_NOTFOUND` | 0xFFF6 | Comando no reconocido |
+| `OK` | 0xFFFE | Operación correcta |
+| `BAD_CRC` | 0xFFF3 | CRC de la trama no coincide |
+| `BAD_SECUENCE` | 0xFFF4 | Número de secuencia inesperado |
+| `DISCONNECT` | 0xFFFB | Reset de secuencias (respuesta al primer ACK) |
+| `NOTFOUND` | 0xFFF6 | Comando no reconocido |
 
 ---
 
@@ -262,8 +262,8 @@ Los siguientes valores son constantes en `main.cpp`. Para modificarlos hay que r
 - [ ] Conectar M5Dial, abrir monitor serie (115 200 baud).
 - [ ] Anotar la MAC impresa: `[ESPNOW] MAC: XX:XX:XX:XX:XX:XX`.
 - [ ] Registrar esa MAC en el Bridge como dispositivo Cerradura Kaizen.
-- [ ] Enviar `K_ACK` desde el Bridge para iniciar handshake.
+- [ ] Enviar `ACK` desde el Bridge para iniciar handshake.
 - [ ] Enviar `KAIZEN_CONFIG` con el nombre del espacio, las matrículas autorizadas y el flag de modo.
-- [ ] Verificar que la cerradura responde `K_OK` y actualiza la pantalla con el nombre del espacio.
+- [ ] Verificar que la cerradura responde `OK` y actualiza la pantalla con el nombre del espacio.
 - [ ] Enviar `KAIZEN_SYNC` periódico para mantener `bridgeOK = true`.
 - [ ] Verificar timeout: detener el Bridge 2 min → la pantalla debe volver al modo reloj simple.

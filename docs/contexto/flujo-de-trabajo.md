@@ -90,7 +90,7 @@ No hay entorno de staging. El deploy es directo al dispositivo físico:
 4. Verificar funcionamiento con tarjeta real y Bridge activo.
 5. Desconectar USB-C e instalar el dispositivo en su ubicación física.
 
-> OTA vía ESP-NOW está implementado en el protocolo (`K_UPDATE 0xFFED`), pero el mecanismo de aplicación no está documentado en el repo. [PENDIENTE: confirmar si existe código OTA activo]
+> OTA vía ESP-NOW está implementado en el protocolo (`UPDATE 0xFFED`), pero el mecanismo de aplicación no está documentado en el repo. [PENDIENTE: confirmar si existe código OTA activo]
 
 ---
 
