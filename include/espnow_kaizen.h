@@ -42,8 +42,8 @@
 #define KAIZEN_SET_TIME         0x00B2  // Bridge envía hora local como epoch(4LE)
 
 #define OK              0xFFFE
-#define DISCONNECT      0xFFFB
-#define ACK             0xFFF8
+//#define DISCONNECT      0xFFFB
+//#define ACK             0xFFF8
 #define NOTFOUND        0xFFF6
 #define BAD_SECUENCE    0xFFF4
 #define BAD_CRC         0xFFF3

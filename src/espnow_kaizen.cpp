@@ -221,28 +221,39 @@ static bool _kResponder(uint16_t cmd, uint8_t b) { return _kResponder(cmd, &b, 1
 static void _kProcesar() {
     _kEnsurePeer();
 
-    // ── Gestión de secuencia (idéntica a TRM)
-    uint8_t seqAlt = _kSeqEsperada + 1;
-    if (seqAlt == 0) seqAlt++;
-    if (_kMsgIn.seq == seqAlt) {
+    // ── Gestión de secuencia (portado directamente del original TRM)
+    uint8_t seqaux2 = _kSeqEsperada + 1;
+    if (seqaux2 == 0) seqaux2++;
+    if (_kMsgIn.seq == seqaux2) {
         _kSeqEsperada++;
         if (_kSeqEsperada == 0) _kSeqEsperada++;
+        Serial.printf("[ESPNOW] Asumimos secuencia recibida como buena\n");
     }
 
     Serial.printf("[ESPNOW] RX cmd=0x%04X seq=%u/%u len=%u\n", _kMsgIn.comando, _kMsgIn.seq, _kSeqEsperada, _kLenMsgIn);
 
     if (_kMsgIn.seq != _kSeqEsperada && _kMsgIn.seq != 0) {
-        uint8_t seqPrev = _kSeqEsperada - 1;
-        if (seqPrev == 0) seqPrev--;
-        if (seqPrev == _kMsgIn.seq || _kMsgIn.seq == 0) {
-            Serial.printf("[ESPNOW] SEQ duplicada (%u), reenviando ultimo mensage\n", _kMsgIn.seq);
-            _kMsgEnviado = false;
-            esp_now_send(_kMacBridge, (uint8_t *)&_kMsgResp, _kLenMsgResp);
-            uint32_t lim = millis() + KAIZEN_TIMEOUT_SEND_MS;
-            while (!_kMsgEnviado && millis() < lim) vTaskDelay(5);
+        if (_kSeqEsperada == 0) {
+            _kResponder(BAD_SECUENCE, &_kSeqEsperada, 1);
+            _kSeqEsperada = 0;
         } else {
-            Serial.printf("[ESPNOW] BAD_SEQ recibida=%u esperada=%u\n", _kMsgIn.seq, _kSeqEsperada);
-            _kResponder(BAD_SECUENCE, _kSeqEsperada);
+            uint8_t seqaux = _kSeqEsperada - 1;
+            if (seqaux == 0) seqaux--;
+            if (seqaux == _kMsgIn.seq) {
+                Serial.printf("[ESPNOW] SEQ duplicada (%u), reenviando ultimo mensaje\n", _kMsgIn.seq);
+                _kMsgEnviado = false;
+                esp_now_send(_kMacBridge, (uint8_t *)&_kMsgResp, _kLenMsgResp);
+                uint32_t lim = millis() + KAIZEN_TIMEOUT_SEND_MS;
+                while (!_kMsgEnviado && millis() < lim) vTaskDelay(5);
+            } else if (_kMsgIn.seq == 0) {
+                Serial.printf("[ESPNOW] SEQ=0 recibida, reenviando ultimo mensaje\n");
+                _kMsgEnviado = false;
+                esp_now_send(_kMacBridge, (uint8_t *)&_kMsgResp, _kLenMsgResp);
+                uint32_t lim = millis() + KAIZEN_TIMEOUT_SEND_MS;
+                while (!_kMsgEnviado && millis() < lim) vTaskDelay(5);
+            } else {
+                Serial.printf("[ESPNOW] CASO SIN CONTEMPLAR, CREO QUE SE HA REINICIADO EL BRIDGE recibida=%u esperada=%u\n", _kMsgIn.seq, _kSeqEsperada);
+            }
         }
         return;
     }
@@ -263,18 +274,6 @@ static void _kProcesar() {
 
     // ── Dispatch de comandos
     switch (_kMsgIn.comando) {
-
-        case ACK: {
-            // Primer ACK: responder DISCONNECT para resetear secuencias
-            if (_kPrimerACK) {
-                _kResponder(DISCONNECT);
-                _kPrimerACK = false;
-            } else {
-                _kResponder(OK);
-            }
-            break;
-        }
-
 
         case MENSAJE_COMPLETO_ESPACIO: {
             // flags(1) + n_mats(1) + mats(n×8) + len_nombre(1) + nombre
